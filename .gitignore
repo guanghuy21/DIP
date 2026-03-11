@@ -1,0 +1,26 @@
+# Virtual Environment
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Data / outputs
+data/
+*.csv
+*.png
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+*.zip
+*.log
+.env

@@ -1,0 +1,31 @@
+web_server_project/
+│
+├── main.py                     # The "Boss" Thread (Orchestrator)
+├── worker.cfg                  # Configuration file (passed via --config)
+├── requirements.txt            # Python dependencies
+│
+├── api/                        # API Gateway & Web Interface
+│   ├── __init__.py
+│   ├── gateway.py              # FastAPI or Flask backbone
+│   └── routes.py               # Endpoint definitions
+│
+├── core/                       # Shared system logic
+│   ├── __init__.py
+│   ├── initialize.py          # initsubsystems logic (Hardware checks)
+│   └── utils.py                # Thread-safe logging or shared helpers
+│
+├── workers/                    # The 4 Worker Threads
+│   ├── __init__.py
+│   ├── base_worker.py          # (Optional) Parent class for all workers
+│   ├── vna_worker.py           # VNA logic
+│   ├── lidar_worker.py         # Lidar logic (writes to data/lidar_scan)
+│   ├── gui_worker.py           # Local dashboard or UI logic
+│   └── robot_worker.py         # Robot movement logic
+│
+└── data/                       # Physical storage for sensor output
+    └── lidar_scan/             # Lidar data repository
+        ├── scan_metadata.json
+        └── raw_points.log      # Your lidar_scan data goes here
+    └── tof_data/
+        ├── tof.log
+        └── tof_contour 
