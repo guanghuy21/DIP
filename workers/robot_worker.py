@@ -21,8 +21,8 @@ class RobotThread(threading.Thread):
 
     def run(self):
         print(f"[{self.name}] Robot controller active...")
-        while True:
-            time.sleep(1)
+        # while True:
+        #     time.sleep(1)
 
     def _log_raw_data(self, raw_A):
         """Logs raw data with a timestamp to data/tof_logs/tof.log."""
