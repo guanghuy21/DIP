@@ -8,52 +8,49 @@ import base64
 import os
 import csv
 
-BAUD_RATE   = 9600   # must match Serial.begin(9600) in Arduino
-TIMEOUT_SEC = 10     # seconds to wait for Arduino reply (movement can be slow)
+BAUD_RATE    = 115200
+TIMEOUT_SEC  = 5      # how long to wait for Arduino reply
 
 class RobotThread(threading.Thread):
     def __init__(self, name):
         super().__init__(name=name)
-        self.daemon       = True
+        self.daemon      = True
         self.R_trajectory = 40
-        self.position     = {"x": 0, "y": 0, "z": 0}
-        self.is_moving    = False
+        self.position    = {"x": 0, "y": 0, "z": 0}
+        self.is_moving   = False
 
-        self._serial      = None
-        self._serial_lock = threading.Lock()
-        self.port         = None
+        # Serial state — configured by connect() before use
+        self._serial     = None
+        self._serial_lock = threading.Lock()  # prevents two threads writing at the same time
+        self.port        = None
 
         self.log_path = "data/tof_logs/tof.log"
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
 
-    # ──────────────────────────────────────────────
+
     # LIFECYCLE
-    # ──────────────────────────────────────────────
 
     def run(self):
+        """Keep-alive loop. Serial is opened once via connect()."""
         print(f"[{self.name}] Robot controller active...")
         while True:
+            # Watchdog: attempt reconnect if connection dropped
             if self.port and (self._serial is None or not self._serial.is_open):
                 print(f"[{self.name}] Serial lost — reconnecting...")
                 self._connect(self.port)
             time.sleep(2)
 
     def connect(self, port):
-        """Open serial to Arduino. Call this before any move_to() calls."""
+        """Called from the route or main.py to open serial before first use."""
         self.port = port
         self._connect(port)
 
     def _connect(self, port):
+        """Opens serial connection to Arduino."""
         try:
             self._serial = serial.Serial(port, BAUD_RATE, timeout=TIMEOUT_SEC)
-            time.sleep(2)  # Arduino resets on serial open — wait for READY
-
-            # Drain the READY message Arduino sends on boot
-            if self._serial.in_waiting:
-                boot_msg = self._serial.readline().decode('utf-8').strip()
-                print(f"[{self.name}] Arduino boot: {boot_msg}")
-
-            print(f"[{self.name}] Connected to Arduino on {port} @ {BAUD_RATE}")
+            time.sleep(2)  # wait for Arduino to reset after serial open
+            print(f"[{self.name}] Connected to Arduino on {port}")
         except serial.SerialException as e:
             self._serial = None
             print(f"[{self.name}] ERROR connecting to Arduino: {e}")
@@ -63,83 +60,66 @@ class RobotThread(threading.Thread):
     # ──────────────────────────────────────────────
 
     def _send_command(self, cmd: str) -> str:
-        """Send one command line to Arduino, return its response line.
+        """Sends a command string to Arduino and returns the response line.
         
-        Thread-safe — _serial_lock prevents concurrent writes.
-        Raises RuntimeError if serial is not open or command fails.
+        Thread-safe via _serial_lock — only one command in flight at a time.
+        
+        Returns response string, or raises RuntimeError on failure.
         """
         if self._serial is None or not self._serial.is_open:
-            raise RuntimeError("Serial port not open — call connect(port) first")
+            raise RuntimeError("Serial port not open")
 
         with self._serial_lock:
-            self._serial.reset_input_buffer()
-            self._serial.write(f"{cmd}\n".encode('utf-8'))
-            response = self._serial.readline().decode('utf-8').strip()
-            print(f"[{self.name}]  >> {cmd}")
-            print(f"[{self.name}]  << {response}")
-            return response
+            try:
+                self._serial.reset_input_buffer()
+                self._serial.write(f"{cmd}\n".encode('utf-8'))
+                response = self._serial.readline().decode('utf-8').strip()
+                print(f"[{self.name}] >> {cmd}  |  << {response}")
+                return response
+            except serial.SerialException as e:
+                raise RuntimeError(f"Serial error: {e}")
 
-    # ──────────────────────────────────────────────
     # ARDUINO COMMANDS
-    # ──────────────────────────────────────────────
-
-    def _move_arm(self, x, y, z):
-        """Send MOVE command, expect ACK from Arduino.
-        
-        Arduino runs IK internally, drives all 3 steppers, then replies ACK.
-        This call blocks until movement is physically complete.
-        """
-        # Format: "MOVE 360.00 200.00 100.00"
-        response = self._send_command(f"MOVE {x:.2f} {y:.2f} {z:.2f}")
-        if response == "ACK":
-            return
-        raise RuntimeError(f"Arduino rejected MOVE: {response}")
 
     def _read_tof(self) -> float:
-        """Placeholder — wire in your real ToF sensor read here.
-        
-        If ToF is connected to Arduino:
-            response = self._send_command("READ_TOF")
-            return float(response.split(":")[1])   # expects "TOF:18.4"
-        
-        If ToF is connected directly to Pi/PC via I2C or serial,
-        replace with your sensor library call instead.
-        """
-        raise NotImplementedError("Implement real ToF sensor read here")
+        """Sends READ_TOF to Arduino, parses 'TOF:18.4' response → float cm."""
+        response = self._send_command("READ_TOF")
+        if response.startswith("TOF:"):
+            return float(response.split(":")[1])
+        raise RuntimeError(f"Unexpected ToF response: {response}")
 
-    def get_arduino_status(self):
-        """Send STATUS, returns parsed position dict from Arduino."""
-        response = self._send_command("STATUS")
-        # Expects "POS:360,200,100"
-        if response.startswith("POS:"):
-            x, y, z = response.replace("POS:", "").split(",")
-            return {"x": float(x), "y": float(y), "z": float(z)}
-        raise RuntimeError(f"Unexpected STATUS response: {response}")
+    def _move_arm(self, x, y, z) -> bool:
+        """Sends MOVE command, waits for ACK from Arduino.
+        
+        Arduino expected response: 'ACK' on success, 'ERR:<reason>' on failure.
+        """
+        response = self._send_command(f"MOVE {x:.2f} {y:.2f} {z:.2f}")
+        if response == "ACK":
+            return True
+        raise RuntimeError(f"Move rejected by Arduino: {response}")
 
     # ──────────────────────────────────────────────
     # PUBLIC WORKER METHODS
     # ──────────────────────────────────────────────
 
     def move_to(self, x, y, z, path_tof='tof.csv', done_event=None):
-        """Move SCARA to (x,y,z), read ToF, append to CSV."""
+        """Moves SCARA arm to (x, y, z), reads ToF, appends to CSV."""
         self.is_moving = True
         try:
-            # 1. Send to Arduino — blocks until ACK (movement done)
+            # 1. Send move command — blocks until Arduino ACKs
             self._move_arm(x, y, z)
             self.position = {"x": x, "y": y, "z": z}
 
-            # 2. Read ToF distance
+            # 2. Read ToF from Arduino
             tof_cm = self._read_tof()
 
-            # 3. Log to CSV
+            # 3. Append to CSV
             point_index = self._get_next_tof_index(path_tof)
             os.makedirs(os.path.dirname(path_tof) if os.path.dirname(path_tof) else '.', exist_ok=True)
             with open(path_tof, 'a', newline='') as f:
                 csv.writer(f).writerow([point_index, tof_cm])
-            print(f"[{self.name}] ToF {tof_cm} cm at index {point_index}")
+            print(f"[{self.name}] ToF {tof_cm} cm logged at index {point_index}")
 
-        except NotImplementedError:
-            print(f"[{self.name}] WARNING: ToF not implemented, skipping log.")
         except Exception as e:
             print(f"[{self.name}] ERROR in move_to: {e}")
         finally:
@@ -150,10 +130,15 @@ class RobotThread(threading.Thread):
         return self.position
 
     def process_data(self, raw_A=None, path=None):
-        """Generate B-Scan image from raw ToF list or CSV file."""
+        """Maps ToF data and generates a B-Scan image.
+
+        Accepts either:
+          - raw_A: list of ToF readings directly (for testing)
+          - path:  path to tof.csv (for production)
+        """
         if raw_A is None:
             if path is None:
-                print(f"[{self.name}] ERROR: provide raw_A or path.")
+                print(f"[{self.name}] ERROR: provide either raw_A or path.")
                 return [], [], None
             raw_A = []
             try:
@@ -162,12 +147,14 @@ class RobotThread(threading.Thread):
                         if row:
                             raw_A.append(float(row[1]))
             except Exception as e:
-                print(f"[{self.name}] ERROR reading CSV: {e}")
+                print(f"[{self.name}] ERROR reading ToF CSV: {e}")
                 return [], [], None
 
         self._log_raw_data(raw_A)
+
         num_points = len(raw_A)
         if num_points < 2:
+            print(f"[{self.name}] Not enough ToF points.")
             return [], [], None
 
         angles_rad = np.radians(np.linspace(0, 360, num_points, endpoint=False))
@@ -176,10 +163,11 @@ class RobotThread(threading.Thread):
         for i in range(num_points):
             xs = self.R_trajectory * np.cos(angles_rad[i])
             ys = self.R_trajectory * np.sin(angles_rad[i])
-            x_sensor.append(xs); y_sensor.append(ys)
-            r = self.R_trajectory - raw_A[i]
-            x_trunk.append(r * np.cos(angles_rad[i]))
-            y_trunk.append(r * np.sin(angles_rad[i]))
+            x_sensor.append(xs)
+            y_sensor.append(ys)
+            r_trunk = self.R_trajectory - raw_A[i]
+            x_trunk.append(r_trunk * np.cos(angles_rad[i]))
+            y_trunk.append(r_trunk * np.sin(angles_rad[i]))
 
         fig = plt.figure(figsize=(12, 12))
         plt.plot(0, 0, 'kx', markersize=12, markeredgewidth=2, label='Orbit Center (0,0)')
@@ -213,12 +201,13 @@ class RobotThread(threading.Thread):
     # ──────────────────────────────────────────────
 
     def _log_raw_data(self, raw_A):
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        timestamp   = time.strftime("%Y%m%d-%H%M%S")
+        data_string = ",".join(map(str, raw_A))
         try:
             with open(self.log_path, "a") as f:
-                f.write(f"{timestamp},{','.join(map(str, raw_A))}\n")
+                f.write(f"{timestamp},{data_string}\n")
         except Exception as e:
-            print(f"[{self.name}] ERROR logging: {e}")
+            print(f"[{self.name}] ERROR Logging Data: {e}")
 
     def _get_next_tof_index(self, path_tof):
         if not os.path.exists(path_tof):
