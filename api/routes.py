@@ -189,13 +189,6 @@ def robot_move():
 
 #     return x
 
-# --- VNA TESTING ---
-@api_blueprint.route('/vna/data', methods=['GET'])
-def vna_data():
-    vna = current_app.config.get('VNA_WORKER')
-    if not vna:
-        return jsonify({"error": "exitcode:404"}), 404
-    return jsonify(vna.get_data()), 200
 
 # --- GUI TESTING ---
 @api_blueprint.route('/gui/health', methods=['GET'])
