@@ -300,7 +300,7 @@ def process():
         "r_exp":    r_exp,      # GUI reads this as data.r_exp
         "points":   points      # GUI reads this as data.points
     }), 200
- @api_blueprint.route('/start_run', methods=['POST'])
+@api_blueprint.route('/start_run', methods=['POST'])
 def start_run():
     lidar_worker = current_app.config.get('LIDAR_WORKER')
     robot_worker = current_app.config.get('ROBOT_WORKER')
