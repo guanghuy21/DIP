@@ -140,58 +140,54 @@ def robot_move():
 
 
 
-@api_blueprint.route('/start_run', methods=['POST'])
-def start_run():
-    lidar_worker = current_app.config.get('LIDAR_WORKER')
-    robot_worker = current_app.config.get('ROBOT_WORKER')
-    vna_worker   = current_app.config.get('VNA_WORKER')
+# @api_blueprint.route('/start_run', methods=['POST'])
+# def start_run():
+#     lidar_worker = current_app.config.get('LIDAR_WORKER')
+#     robot_worker = current_app.config.get('ROBOT_WORKER')
+#     vna_worker   = current_app.config.get('VNA_WORKER')
 
-    data   = request.get_json()
-    port   = data.get("port")
-    radius = data.get("radius")
+#     data   = request.get_json()
+#     port   = data.get("port")
+#     radius = data.get("radius")
 
-    if radius:
-        robot_worker.R_trajectory = float(radius)
+#     if radius:
+#         robot_worker.R_trajectory = float(radius)
 
-    # 1. LiDAR scan — block until done
-    done = threading.Event()
-    lidar_worker.scan(port=port, done_event=done)
-    done.wait()
+#     # 1. LiDAR scan — block until done
+#     done = threading.Event()
+#     lidar_worker.scan(port=port, done_event=done)
+#     done.wait()
 
-    path_to_lidar = os.path.join(current_app.config.get('LIDAR_DATA'), 'raw.csv')
-    points, r_exp, _ = lidar_worker.process_data(path=path_to_lidar)
+#     path_to_lidar = os.path.join(current_app.config.get('LIDAR_DATA'), 'raw.csv')
+#     points, r_exp, _ = lidar_worker.process_data(path=path_to_lidar)
 
-    # 2. Robot + VNA — block on every move then every VNA collect
-    path_to_tof = os.path.join(current_app.config.get('TOF_RECORD'), 'tof.csv')
-    vna_results = []
+#     # 2. Robot + VNA — block on every move then every VNA collect
+#     path_to_tof = os.path.join(current_app.config.get('TOF_RECORD'), 'tof.csv')
+#     vna_results = []
 
-    # Reset tof.csv before each run
-    os.makedirs(os.path.dirname(path_to_tof), exist_ok=True)
-    open(path_to_tof, 'w').close()
+#     # Reset tof.csv before each run
+#     os.makedirs(os.path.dirname(path_to_tof), exist_ok=True)
+#     open(path_to_tof, 'w').close()
 
-    for i, point in enumerate(points):
-        x, y, z = point["x"], point["y"], point["z"]
+#     for i, point in enumerate(points):
+#         x, y, z = point["x"], point["y"], point["z"]
 
-        # Block until arm has moved AND tof is logged
-        done = threading.Event()
-        robot_worker.move_to(x, y, z, path_tof=path_to_tof, done_event=done)
-        done.wait()
+#         # Block until arm has moved AND tof is logged
+#         done = threading.Event()
+#         robot_worker.move_to(x, y, z, path_tof=path_to_tof, done_event=done)
+#         done.wait()
 
-        # Block until VNA collection is done
-        done = threading.Event()
-        vna_worker.collect_data(f'{i + 1}.csv', done_event=done)
-        done.wait()
+#         # Block until VNA collection is done
+#         done = threading.Event()
+#         vna_worker.collect_data(f'{i + 1}.csv', done_event=done)
+#         done.wait()
 
-        vna_results.append(f'{i + 1}.csv')
+#         vna_results.append(f'{i + 1}.csv')
 
-    # 3. Generate B-Scan image
-    x_trunk, y_trunk, img = robot_worker.process_data(path=path_to_tof)
+#     # 3. Generate B-Scan image
+#     x_trunk, y_trunk, img = robot_worker.process_data(path=path_to_tof)
 
-    return jsonify({
-        "msg": "Run complete",
-        "bscan_image": img,
-        "vna_files": vna_results
-    }), 200
+#     return x
 
 # --- VNA TESTING ---
 @api_blueprint.route('/vna/data', methods=['GET'])
