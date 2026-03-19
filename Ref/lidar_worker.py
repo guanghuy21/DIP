@@ -430,7 +430,7 @@ class LidarThread(threading.Thread):
                 time.sleep(2.0)
         return False
 
-    def _detect_distance(self, num_scans=5, min_quality=10, front_angle_tolerance=10):
+    def _detect_distance(self, num_scans=5, min_quality=10, front_angle_tolerance=1):
         def is_front(angle):
             return angle <= front_angle_tolerance or angle >= (360 - front_angle_tolerance)
 
@@ -450,7 +450,8 @@ class LidarThread(threading.Thread):
         if not front_dist:
             return None, None
 
-        avg_dist   = statistics.mean(front_dist)
+        # avg_dist   = statistics.mean(front_dist)
+        avg_dist = min(front_dist)
         normalized = [a - 360 if a > 180 else a for a in front_angles]
         avg_angle  = statistics.mean(normalized)
         if avg_angle < 0:
