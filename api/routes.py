@@ -53,7 +53,7 @@ def lidar_scan_data():
 
     data                = request.get_json()
     port                = data.get("port")
-    radius_mm           = data.get("radius_mm")
+    radius_cm           = data.get("radius_cm")
     distance_cm         = data.get("distance_cm")       # None → triggers auto-detect in scan()
     safety_margin_deg   = data.get("safety_margin_deg")
     scan_duration_sec   = data.get("scan_duration_sec")
@@ -63,7 +63,7 @@ def lidar_scan_data():
     done = threading.Event()
     lidar_worker.scan(
         port,
-        radius_mm,
+        radius_cm,
         distance_cm,
         safety_margin_deg,
         scan_duration_sec,
@@ -76,7 +76,6 @@ def lidar_scan_data():
 
     return jsonify({
         # "port":                 port,
-        # "radius_mm":            radius_mm,
         # "distance_cm":          distance_cm,
         # "safety_margin_deg":    safety_margin_deg,
         # "scan_duration_sec":    scan_duration_sec,

@@ -8,7 +8,7 @@ import statistics
 import numpy as np
 
 # Configuration
-PORT = 'COM3'  # Change to your port
+PORT = 'COM4'  # Change to your port
 BAUDRATE = 115200
 TIMEOUT = 3
 MOTOR_STARTUP_DELAY = 3  # seconds to wait for motor stabilization
