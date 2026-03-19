@@ -136,7 +136,7 @@ class VNAThread(threading.Thread):
         """
         try:
             real, imag = self._run_until_convergence(
-                numtrace     = 4,
+                numtrace     = 1,
                 tolerances   = self._tolerances,
                 max_attempts = self._max_attempts,
             )
@@ -216,7 +216,7 @@ class VNAThread(threading.Thread):
             for prev, curr in zip(previous_magnitudes, magnitudes)
         ]
 
-    def _run_until_convergence(self, numtrace=4, tolerances=None, max_attempts=20):
+    def _run_until_convergence(self, numtrace=1, tolerances=None, max_attempts=20):
         if tolerances is None:
             tolerances = [1] * numtrace
 
