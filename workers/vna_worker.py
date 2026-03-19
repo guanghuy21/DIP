@@ -249,16 +249,10 @@ class VNAThread(threading.Thread):
 
         print(f"[{self.name}] Maximum attempts reached. Convergence not achieved.")
         print(f"[{self.name}] ERROR: Not enough data collected for B-scan")
-        self._alarm()
         return None, None
 
     def _alarm(self):
-        if _WINSOUND_AVAILABLE:
-            for _ in range(5):
-                winsound.Beep(1000, 300)
-                time.sleep(0.1)
-        else:
-            print(f"[{self.name}] [ALARM]")
+        print(f"[{self.name}] [ALARM]: No VNA Connection, Test mode ON")
 
     def _cleanup(self):
         if self._vna is not None:
