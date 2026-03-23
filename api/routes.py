@@ -9,38 +9,21 @@ api_blueprint = Blueprint('api', __name__)
 
 @api_blueprint.route('/hello', methods=['GET'])
 def hello():
-    return jsonify({"answer": "how are you"}), 200
+    return jsonify({"answer": "hello, system is good"}), 200
 
 # You can add more routes here easily
 @api_blueprint.route('/status', methods=['GET'])
 def status():
     return jsonify({"status": "All systems nominal"}), 200
 
-@api_blueprint.route('/lidar/process_data', methods=['POST'])
-def lidar_process_data():
-    data = request.get_json()
-    path = data.get("path")
-    path = os.path.join(current_app.config.get('LIDAR_DATA') , path) if path else "raw.csv"
-    
-    if not path:
-        return jsonify({"error": "No path provided"}), 400
-
-    # 2. Access the Lidar worker instance (passed from the Boss)
-    lidar_worker = current_app.config.get('LIDAR_WORKER')
-    
-    if not lidar_worker:
-        return jsonify({"error": "Lidar worker not initialized"}), 500
-
-    # 3. Call the worker method
-    try:
-        points, r, plot_b64 = lidar_worker.process_data(path=path)
-        return jsonify({"points": points, "r": r, "image": plot_b64}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
-
 @api_blueprint.route('/lidar/scan', methods=['POST'])
 def lidar_scan_data():
+    '''
+    Def:
+    Input:
+    JSON
+    Output:
+    '''
     lidar_worker = current_app.config.get('LIDAR_WORKER')
     if not lidar_worker:
         return jsonify({"error": "Lidar worker not initialized"}), 500
@@ -86,7 +69,30 @@ def lidar_scan_data():
         "bscan_image":          img
     }), 200
 
+@api_blueprint.route('/lidar/process_data', methods=['POST'])
+def lidar_process_data():
+    data = request.get_json()
+    path = data.get("path")
+    path = os.path.join(current_app.config.get('LIDAR_DATA') , path) if path else "raw.csv"
     
+    if not path:
+        return jsonify({"error": "No path provided"}), 400
+
+    # 2. Access the Lidar worker instance (passed from the Boss)
+    lidar_worker = current_app.config.get('LIDAR_WORKER')
+    
+    if not lidar_worker:
+        return jsonify({"error": "Lidar worker not initialized"}), 500
+
+    # 3. Call the worker method
+    try:
+        points, r, plot_b64 = lidar_worker.process_data(path=path)
+        return jsonify({"points": points, "r": r, "image": plot_b64}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+
+
 @api_blueprint.route('/robot/status', methods=['GET'])
 def robot_status():
     robot = current_app.config.get('ROBOT_WORKER')
@@ -533,3 +539,64 @@ def vna_collect():
 #         "scans_done": last if last is not None else 0,
 #         "last_file":  f"{last}.csv" if last is not None else None,
 #     }), 200
+
+# =============================================================================
+# TOF ROUTES
+# =============================================================================
+@api_blueprint.route('/tof/scan', methods=['POST'])
+def tof_scan():
+    tof = current_app.config.get('TOF_WORKER')
+    if not tof:
+        return jsonify({"error": "TOF worker not initialized"}), 500
+
+    port = (request.get_json() or {}).get("port","COM5")
+    done = threading.Event()
+    try:
+        print(f"[{tof.name}]: Connecting to port {port}")
+        distances = tof.record(port = port, done_event=done)
+    except:
+        distances = 'null'
+    done.wait()
+
+    return jsonify({"msg": "Recorded", "zones": distances}), 200
+
+@api_blueprint.route('/tof/reset', methods=['GET'])
+def tof_reset():
+    tof = current_app.config.get('TOF_WORKER')
+    if not tof:
+        return jsonify({"error": "TOF worker not initialized"}), 500
+
+    try:
+        tof.reset()
+        return jsonify({"msg": "Reset log"}), 200
+    except Exception as e:
+        print(f"[{tof.name}] Error: {e}")
+        return jsonify({"error": str(e)}), 500  # str(e) so jsonify can serialize it
+
+@api_blueprint.route('/tof/process_data', methods=['POST'])
+def tof_process_data():
+    data         = request.get_json() or {}
+    path         = data.get("path")
+    r_trajectory = data.get("r_trajectory", 40)
+    arc_span     = data.get("arc_span", 360)
+
+    if path:
+        path = os.path.join(current_app.config.get('TOF_RECORD'), path)
+
+    tof = current_app.config.get('TOF_WORKER')
+    if not tof:
+        return jsonify({"error": "TOF worker not initialized"}), 500
+
+    try:
+        x_trunk, y_trunk, plot_b64 = tof.process_data(
+            path=path,
+            r_trajectory=r_trajectory,
+            arc_span=arc_span
+        )
+        return jsonify({
+            "x_trunk":  x_trunk,
+            "y_trunk":  y_trunk,
+            "image":    plot_b64
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

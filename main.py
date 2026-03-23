@@ -13,7 +13,8 @@ WORKER_DEFINITIONS = {
     "lidar": {"module": "workers.lidar_worker", "class": "LidarThread"},
     "vna":   {"module": "workers.vna_worker",   "class": "VNAThread"},
     "robot": {"module": "workers.robot_worker", "class": "RobotThread"},
-    "gui":   {"module": "workers.gui_worker",   "class": "GUIThread"}
+    "gui":   {"module": "workers.gui_worker",   "class": "GUIThread"},
+    "tof":   {"module": "workers.tof_worker",   "class": "TOFThread"}
 }
 
 GUI_DIR  = os.path.join(os.path.dirname(__file__), "gui")
