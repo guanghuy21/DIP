@@ -10,6 +10,7 @@ import csv
 
 BAUD_RATE   = 9600   # must match Serial.begin(9600) in Arduino
 TIMEOUT_SEC = 10     # seconds to wait for Arduino reply (movement can be slow)
+MM_TO_CM = 0.1       # points from LidarThread.process_data() are in mm; Arduino expects cm
 
 class RobotThread(threading.Thread):
     def __init__(self, name):
@@ -148,6 +149,137 @@ class RobotThread(threading.Thread):
                 done_event.set()
 
         return self.position
+    
+    # ------------------------------------------------------------------ #
+    #  submit_contour() — public API                                      #
+    # ------------------------------------------------------------------ #
+    def submit_contour(self, points: list, path_tof: str = 'tof.csv') -> threading.Event:
+        """
+        Run the full contour traversal in the background.
+        Returns a threading.Event — call .wait() to block until all points
+        are visited and the END signal has been sent.
+ 
+        Usage:
+            robot = RobotThread("Robot-1")
+            robot.connect("COM4")
+            robot.start()
+ 
+            done = robot.submit_contour(points)
+            done.wait()
+            x_trunk, y_trunk, plot_b64 = robot.process_data(path='tof.csv')
+        """
+        done_event = threading.Event()
+        t = threading.Thread(
+            target=self._contour_worker,
+            args=(points, path_tof, done_event),
+            name=f"{self.name}-contour",
+            daemon=True,
+        )
+        t.start()
+        return done_event
+ 
+    # ------------------------------------------------------------------ #
+    #  run_contour() — blocking version                                   #
+    # ------------------------------------------------------------------ #
+    def run_contour(self, points: list, path_tof: str = 'tof.csv') -> None:
+        """
+        Blocking version of submit_contour().
+        Iterates through every point from LidarThread.process_data(),
+        moves the arm to each one, reads ToF, and logs results.
+        Sends END to Arduino when all points are covered.
+ 
+        points  — list of dicts: [{"x": mm, "y": mm, "z": mm}, ...]
+        path_tof — CSV file to append ToF readings to
+        """
+        self._contour_worker(points, path_tof, done_event=None)
+ 
+    # ------------------------------------------------------------------ #
+    #  _contour_worker() — internal traversal logic                      #
+    # ------------------------------------------------------------------ #
+    def _contour_worker(self, points: list, path_tof: str,
+                        done_event: threading.Event | None) -> None:
+        """
+        Core point-by-point traversal.
+ 
+        For each point in `points`:
+          1. Convert x, y, z from mm → cm  (Arduino expects cm)
+          2. Send MOVE command via _move_arm() — blocks until ACK
+          3. Read ToF sensor
+          4. Append (index, tof_cm) to path_tof CSV
+ 
+        After all points:
+          5. Send END command so Arduino can de-energise motors
+ 
+        Skips unreachable points gracefully (Arduino returns non-ACK);
+        execution continues with the next point.
+        """
+        if not points:
+            print(f"[{self.name}] run_contour: empty points list, nothing to do.")
+            if done_event:
+                done_event.set()
+            return
+ 
+        self.is_moving = True
+        total   = len(points)
+        skipped = 0
+ 
+        os.makedirs(
+            os.path.dirname(path_tof) if os.path.dirname(path_tof) else '.',
+            exist_ok=True
+        )
+ 
+        print(f"[{self.name}] Starting contour traversal — {total} points → {path_tof}")
+ 
+        try:
+            for i, pt in enumerate(points):
+                # ── Unit conversion: mm → cm ──────────────────────────────
+                x_cm = pt["x"] * MM_TO_CM
+                y_cm = pt["y"] * MM_TO_CM
+                z_cm = pt["z"] * MM_TO_CM
+ 
+                print(f"[{self.name}] Point {i+1:>2}/{total}  "
+                      f"x={x_cm:.3f} y={y_cm:.3f} z={z_cm:.3f} cm", end="  ")
+ 
+                # ── Move arm ──────────────────────────────────────────────
+                try:
+                    self._move_arm(x_cm, y_cm, z_cm)
+                    self.position = {"x": x_cm, "y": y_cm, "z": z_cm}
+                    print("✓ ACK", end="  ")
+                except RuntimeError as e:
+                    print(f"⚠ SKIPPED ({e})")
+                    skipped += 1
+                    continue    # skip ToF read for unreachable points
+ 
+                # ── Read ToF ──────────────────────────────────────────────
+                try:
+                    tof_cm = self._read_tof()
+                    point_index = self._get_next_tof_index(path_tof)
+                    with open(path_tof, 'a', newline='') as f:
+                        csv.writer(f).writerow([point_index, tof_cm])
+                    print(f"ToF={tof_cm:.2f} cm  idx={point_index}")
+                except NotImplementedError:
+                    print("ToF=N/A (not implemented)")
+                except Exception as e:
+                    print(f"ToF ERROR: {e}")
+ 
+            # ── Signal end of sequence to Arduino ─────────────────────────
+            try:
+                response = self._send_command("END")
+                print(f"[{self.name}] END sent → Arduino: {response}")
+            except Exception as e:
+                print(f"[{self.name}] WARNING: END command failed: {e}")
+ 
+            print(f"[{self.name}] Contour complete. "
+                  f"{total - skipped}/{total} points executed, "
+                  f"{skipped} skipped.")
+ 
+        except Exception as e:
+            print(f"[{self.name}] ERROR during contour traversal: {e}")
+            import traceback; traceback.print_exc()
+        finally:
+            self.is_moving = False
+            if done_event:
+                done_event.set()
 
     def process_data(self, raw_A=None, path=None):
         """Generate B-Scan image from raw ToF list or CSV file."""
