@@ -4,9 +4,9 @@ web_server_project/
 ├── worker.cfg                  # Configuration file (passed via --config)
 ├── requirements.txt            # Python dependencies
 │
-├── api/                        # API Gateway & Web Interface
+├── api/                        # API Gateway
 │   ├── __init__.py
-│   ├── gateway.py              # FastAPI or Flask backbone
+│   ├── gateway.py              # Flask backbone
 │   └── routes.py               # Endpoint definitions
 │
 ├── core/                       # Shared system logic

@@ -146,21 +146,6 @@ def connect_to_vna(addr, VNA_model):
         alarm()
         return None
 
-def connect_to_arduino(comport):
-    try:
-        arduino = serial.Serial(comport)
-        arduino.baudrate = 9600
-        arduino.timeout = 5
-        arduino.bytesize = 8
-        arduino.parity = 'N'
-        arduino.stopbits = 1
-        print("Connected to Arduino via", comport)
-        return arduino
-    except serial.SerialException as e:
-        print(f"An error occurred while connecting to Arduino via {comport}: {e}")
-        alarm()
-        return None
-
 def bscan(count):
     angle = []
     step = 360/count
@@ -184,58 +169,6 @@ def env_creation(env_name, start, retry_flag=False):
         last_folder = folder
 
     return folder
-
-def set_rotator(angle, rotator): #Currently the rotator command is R1->36
-    print(f'Rotator angle: {round(angle)} degrees')
-    rotator.write(f'R{round(angle)}'.encode("utf-8"))
-    rotator.flushOutput()  # Flush the output buffer
-    count = 0
-    while count < 3:
-        response = rotator.read()
-        if response != b'b':
-            count += 1
-            print(f'Attempt {count}')
-        else:
-            break
-    if count >= 10:
-        print('ERROR: Cannot communicate with Rotator')
-        alarm()
-    rotator.flushInput()  # Flush the input buffer
-
-def set_slider(slider):
-    print(f'\nMoving to Dist: 50cm')
-    command = f'P {round(50 * conversion[0])} {round(90 * conversion[1])}'.encode("utf-8")
-    slider.write(command)
-    slider.flushOutput()  # Flush the output buffer
-    count = 0
-    while count < 3:
-        response = slider.read()
-        if response != b'b':
-            count += 1
-            print(f'Attempt {count}')
-        else:
-            break
-    if count >= 3:
-        print('ERROR: Cannot communicate with Slider')
-        alarm()
-    slider.flushInput()  # Flush the input buffer
-
-def reset_slider(slider):
-    print('\nDone B-scan, Resetting Slider')
-    slider.write(b'c')
-    slider.flushOutput()  # Flush the output buffer
-    count = 0
-    while count < 10:
-        response = slider.read()
-        if response != b'b':
-            count += 1
-            print(f'Attempt {count}')
-        else:
-            break
-    if count >= 10:
-        print('ERROR: Cannot communicate with Slider')
-        alarm()
-    slider.flushInput()  # Flush the input buffer
 
 
 def get_last_existing_number(folder_name):
@@ -262,7 +195,6 @@ def get_last_existing_number(folder_name):
 # Create the working directory, copy the air.csv and matlab code
 # Establish the connections to the arduino and VNA
 
-rotator = connect_to_arduino(Rotator_port)
 vna = connect_to_vna(addr, VNA_model)
 rot = bscan(b_scan_count)
 

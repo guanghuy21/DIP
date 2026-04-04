@@ -70,6 +70,7 @@ class TOFThread(threading.Thread):
         self._conv_window    = []
         self._conv_tolerance = 5.0
         self.converged       = False
+        self.last_distance   = None
 
     # ------------------------------------------------------------------ #
     #  run()                                                              #
@@ -110,7 +111,7 @@ class TOFThread(threading.Thread):
                 ser.write("START\n".encode("utf-8"))
                 ser.flush()
 
-                for _ in range(20):
+                for _ in range(5):
                     raw = ser.readline()
                     if not raw:
                         print(f"[{self.name}] Timeout waiting for DATA:")
@@ -124,6 +125,7 @@ class TOFThread(threading.Thread):
                             ts          = datetime.datetime.now().isoformat()
                             millis      = parts[0].strip()
                             distance_mm = float(parts[1].strip())
+                            self.last_distance = distance_mm 
 
                             with self._lock:
                                 folder = os.path.dirname(self._path)

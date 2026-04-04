@@ -1,271 +1,367 @@
-from ast import Raise
 from rplidar import RPLidar, RPLidarException
-import threading, time, math, statistics, csv, io, base64
-import numpy as np
+import threading, time, math, statistics, csv, io, base64, os, numpy as np
 from circle_fit import taubinSVD
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import os
 
-BAUDRATE            = 115200
-MOTOR_STARTUP_DELAY = 3
-MAX_POINTS          = 10000
+PORT, BAUDRATE, MOTOR_STARTUP_DELAY, MAX_POINTS = 'COM5', 115200, 3, 10000
 
-DEFAULT_RAW_PATH = os.path.join( "data", "lidar_scan")
-DEFAULT_RAW_FILE = os.path.join(DEFAULT_RAW_PATH, "raw.csv")
-DEFAULT_RAW_IMG  = os.path.join(DEFAULT_RAW_PATH, "processed_lidar.png")
-
-os.makedirs(DEFAULT_RAW_PATH, exist_ok=True)
+DEFAULT_CONFIG = {
+    'radius_cm':           5.0,
+    'distance_cm':         None,
+    'safety_margin_deg':   5,
+    'scan_duration_sec':   30,
+    'circle_tolerance_mm': 50,
+    'port':                'COM5',
+    'expand_mm':           100.0,   # how much to expand the fitted circle
+    'n_points':            36,      # number of contour sample points
+    'z_height_mm':         10.0,    # z value assigned to every contour point
+}
 
 
 class LidarThread(threading.Thread):
 
-    def __init__(self, name):
+    def __init__(self, name, config=None):
         super().__init__(name=name)
-        self.daemon  = True
-        self.running = True
-        self._lidar  = None
+        self.daemon = True
+        cfg = {**DEFAULT_CONFIG, **(config or {})}
+
+        if not float(cfg.get('radius_cm', 0)) > 0:
+            raise ValueError("config must contain 'radius_cm' > 0")
+
+        self.radius_cm           = float(cfg['radius_cm'])
+        self.radius_mm           = self.radius_cm * 10
+        self.distance_cm         = float(cfg['distance_cm']) if cfg.get('distance_cm') else None
+        self.auto_detect         = self.distance_cm is None
+        self.safety_margin_deg   = float(cfg.get('safety_margin_deg', 5))
+        self.scan_duration_sec   = float(cfg.get('scan_duration_sec', 30))
+        self.circle_tolerance_mm = float(cfg.get('circle_tolerance_mm', 50))
+        self.port                = cfg.get('port', PORT)
+        self.expand_mm           = float(cfg.get('expand_mm', 100.0))
+        self.n_points            = int(cfg.get('n_points', 36))
+        self.z_height_mm         = float(cfg.get('z_height_mm', 10.0))
+        self.output_path         = 'raw_data.csv'
+        self._lidar              = None
+
+        # --- scan state (read by gateway to poll progress) ---
+        self.scan_status  = 'idle'   # idle | running | done | error
+        self.scan_error   = None
+        self._scan_thread = None
 
     def run(self):
-        print(f"[{self.name}] Lidar controller active...")
-        # while True:
-        #     time.sleep(1)
+        pass  # Thread kept alive by the orchestrator; scanning triggered via scan_async()
 
     # ------------------------------------------------------------------ #
-    #  scan()                                                             #
+    #  PUBLIC API                                                          #
     # ------------------------------------------------------------------ #
-    def scan(self, port, radius_cm, distance_cm=None, safety_margin_deg=5,
-             scan_duration_sec=30, circle_toleration_mm=50, done_event=None):
-        try:
-            self.radius_cm           = radius_cm
-            self.radius_mm           = self.radius_cm * 10
-            self.distance_cm         = distance_cm
-            self.auto_detect         = self.distance_cm is None
-            self.safety_margin_deg   = safety_margin_deg
-            self.scan_duration_sec   = scan_duration_sec
-            self.circle_tolerance_mm = circle_toleration_mm
-            self.port                = port
 
-            if not self._connect_lidar(port):
-                raise RuntimeError("Failed to connect to RPLidar after retries.")
+    def scan_async(self):
+        """
+        Start a scan in a background thread and return immediately.
+        The gateway can poll self.scan_status to know when it's done.
+        """
+        if self.scan_status == 'running':
+            return  # already scanning, ignore duplicate calls
+        self.scan_status = 'running'
+        self.scan_error  = None
+        self._scan_thread = threading.Thread(
+            target=self._scan_worker, name=f"{self.name}-scan", daemon=True
+        )
+        self._scan_thread.start()
 
-            # Auto-detect sensor→object distance if not provided
-            if self.auto_detect:
-                dist_mm, _ = self._detect_distance()
-                if dist_mm is None:
-                    raise RuntimeError("Auto-detection failed – no front points found.")
-                self.distance_cm = dist_mm / 10
-                print(f"[{self.name}] Auto-detected distance: {self.distance_cm:.2f} cm")
-                self._lidar.stop()
-                time.sleep(0.5)
+    def scan_sync(self):
+        """
+        Blocking scan — kept for standalone / CLI use.
+        Returns True on success, False on failure.
+        """
+        self.scan_status = 'running'
+        self.scan_error  = None
+        result = self._scan_worker()
+        return result
 
-            # Angle window around 0° (forward)
-            half    = math.degrees(math.atan(self.radius_cm / self.distance_cm)) + self.safety_margin_deg
-            
-            center_angle = 0
-            min_ang = center_angle - half
-            max_ang = center_angle + half
-            if min_ang < 0:
-                min_ang += 360
-            if max_ang < 0:
-                max_ang += 360
-            
-            total_angle = half * 2
+    def process_data(self, path=None):
+        """
+        Load a CSV of raw scan data, fit a circle, expand it, sample
+        n_points contour points, generate a matplotlib plot.
 
-            buf, circle_params = [], None
-            total_points, points_rejected_angle, points_rejected_circle, points_rejected_buffer = 0, 0, 0, 0
-            scan_count, last_upd = 0, 0
-            t0 = time.time()
+        Returns (points, r_exp, plot_b64) on success.
+        Returns (None, None, None) if there is not enough data.
+        Raises ValueError with a descriptive message on processing failure
+        so the gateway can return a proper 400/500 with context.
+        """
+        if path is None:
+            path = self.output_path
 
-            for attempt in range(3):
-                try:
-                    for scan in self._lidar.iter_scans(max_buf_meas=50000):
-                        current_time = time.time()
-                        elapsed_time = current_time - t0
-                        if elapsed_time >= self.scan_duration_sec:
-                            break
-                    
-                        # LAYER 1: Filter by angle
-                        points_before_angle_filter = len(scan)
-                        filtered_by_angle = self._filter_scan_data(scan, min_ang, max_ang)
-                        points_after_angle_filter = len(filtered_by_angle)
-                        points_rejected_angle += (points_before_angle_filter - points_after_angle_filter)
+        print(f"[{self.name}] Processing: {path}")
+        angles, distances, _ = self._load_csv(path)
 
-                        # Update Circle fit periodically
-                        if scan_count - last_upd >= 5 and len(buf) >= 10:
-                            _, circle_params = self._filter_by_circle(buf, self.radius_mm, self.circle_tolerance_mm)
-                            last_upd = scan_count
-                            
-                            if circle_params and scan_count == 5:
-                                cx, cy, r = circle_params
-                        # LAYER 2: Filter by circle (if we have enough points)
-                        if circle_params is not None:
-                            filtered_by_circle, _ = self._filter_by_circle(filtered_by_angle, self.radius_mm, self.circle_tolerance_mm)
-                            points_rejected_circle += (points_after_angle_filter - len(filtered_by_circle))
-                            filtered_scan = filtered_by_circle
-                        else:
-                            filtered_scan = filtered_by_angle
+        if len(angles) < 10:
+            raise ValueError(
+                f"Too few data points ({len(angles)}) in {path}. "
+                "Re-run the scan or lower circle_tolerance_mm."
+            )
 
-                        # Add filtered points to buffer with quality-based selection
-                        for quality, angle, distance in filtered_scan:
-                            total_points += 1
-                                            
-                            if len(buf) < MAX_POINTS:
-                                # Buffer not full yet, add point directly
-                                buf.append((quality, angle, distance))
-                            else:
-                                # Buffer is full - compare with worst point in buffer
-                                worst_quality = min(buf, key=lambda p: p[0])[0]
-                        
-                                # If new point has better quality, replace worst point
-                                if quality > worst_quality:
-                                    # Remove the worst quality point
-                                    worst_point = min(buf, key=lambda p: p[0])
-                                    buf.remove(worst_point)
-                                    # Add the better quality point
-                                    buf.append((quality, angle, distance))
-                                    points_rejected_buffer += 1
-                                else:
-                                    # New point is not better, reject it
-                                    points_rejected_buffer += 1
-                        scan_count += 1
-                    break  # clean exit — no retry needed
-
-                except RPLidarException as e:
-                    print(f"[{self.name}] Scan error (attempt {attempt + 1}/3): {e}")
-                    if attempt < 2:
-                        print(f"[{self.name}] Reconnecting...")
-                        self._connect_lidar(port)
-                        t0 = time.time()
-                    else:
-                        raise
-
-            buf.sort(key=lambda p: p[1])
-            # _ , final_cir = self._filter_by_circle(buf, self.radius_mm, self.circle_tolerance_mm)
-            # Save raw.csv — columns: quality, angle, distance
-            os.makedirs(DEFAULT_RAW_PATH, exist_ok=True)
-            with open(DEFAULT_RAW_FILE, 'w', newline='') as f:
-                w = csv.writer(f)
-                w.writerow(['angle', 'distance', 'quality'])
-                for quality, angle, distance in buf:
-                    w.writerow([f'{angle:.2f}', f'{distance:.2f}', f'{quality:.2f}'])
-                # w.writerows(buf)
-            print(f"[{self.name}] Saved {len(buf)} points → {DEFAULT_RAW_FILE}")
-
-        except RPLidarException as e:
-            print(f"[{self.name}] RPLidar error: {e}")
-        except Exception:
-            import traceback; traceback.print_exc()
-        finally:
-            self._cleanup()
-            if done_event:
-                done_event.set()
-
-    # ------------------------------------------------------------------ #
-    #  process_data()                                                     #
-    # ------------------------------------------------------------------ #
-    def process_data(self, path=DEFAULT_RAW_FILE):
-        print(f"[{self.name}] Processing file at: {path}")
-
-        qualities, angles, distances = self._load_csv(path)   # matches CSV column order
-
-        if not angles:
-            print(f"[{self.name}] No valid data found.")
-            return None, None, None
-
-        # Normalize angles → (-180, 180]
-        def norm(a):
-            while a >  180: a -= 360
-            while a <= -180: a += 360
-            return a
-        norm_ang = [norm(a) for a in angles]
-
-        # Weighted center angle from closest points
-        n   = max(5, len(distances) // 10)
-        top = sorted(zip(distances, norm_ang))[:n]
-        tw  = sum(1/d for d, _ in top)
-        ca  = sum((1/d)*a for d, a in top) / tw
-
-        # Polar → Cartesian  (0° = forward = +Y)
-        corrected, xs, ys = [], [], []
-        for na, dist in zip(norm_ang, distances):
-            c = na - ca
-            corrected.append(c)
-            rad = math.radians(c)
+        # ── 1. Convert raw polar → Cartesian using RPLidar convention ──────
+        # RPLidar: 0° = forward (+Y), angles increase clockwise.
+        #   x =  distance * sin(angle)   (positive = right)
+        #   y =  distance * cos(angle)   (positive = forward / away from sensor)
+        #
+        # No angle-bias correction before fitting — rotating the point cloud
+        # before taubinSVD distorts the geometry and inflates the fitted radius.
+        # taubinSVD finds the true centre directly from the raw Cartesian coords.
+        # No Y offset either — adding an offset shifts the arc centre and makes
+        # a small bottle (r≈35mm) fit to a much larger circle.
+        xs, ys = [], []
+        for a, dist in zip(angles, distances):
+            rad = math.radians(a)
             xs.append(dist * math.sin(rad))
             ys.append(dist * math.cos(rad))
 
-        idx = sorted(range(len(corrected)), key=lambda i: corrected[i])
-        xs  = [xs[i] for i in idx]
-        ys  = [ys[i] for i in idx]
+        # Sort by angle for clean arc plotting
+        idx = sorted(range(len(angles)), key=lambda i: angles[i])
+        xs = [xs[i] for i in idx]
+        ys = [ys[i] for i in idx]
 
-        # Apply y offset before fitting
-        y_offset_mm = 50.0
-        ys_shifted  = [y + y_offset_mm for y in ys]
+        pts = np.array(list(zip(xs, ys)))
 
-        pts = np.array(list(zip(xs, ys_shifted)))
-        xc, yc, r, sigma = taubinSVD(pts)
+        # ── 5. Fit circle (TaubinSVD) ────────────────────────────────────
+        try:
+            xc, yc, r, sigma = taubinSVD(pts)
+        except Exception as e:
+            raise ValueError(f"Circle fit failed: {e}. Check scan quality.")
 
-        print(f"[{self.name}] Centre ({xc:.2f}, {yc:.2f}) mm | r={r:.2f} mm | σ={sigma:.3f}")
+        if r <= 0 or r > 5000:
+            raise ValueError(
+                f"Fitted radius {r:.1f} mm is implausible. "
+                "Check scan data — possibly too much noise or wrong tolerance."
+            )
 
-        # Expand circle and sample contour
-        expand_mm = 100.0
-        n_points  = 36
-        r_exp     = r + expand_mm
+        print(f"[{self.name}] Fit: centre=({xc:.2f}, {yc:.2f}) mm | r={r:.2f} mm | σ={sigma:.3f}")
 
+        # ── 6. Expand circle & sample contour points ─────────────────────
+        r_exp = r + self.expand_mm
+
+        # Sample evenly CCW starting at 90° (top of circle, +Y direction).
+        # 90° → cos=0, sin=1 → point lands at (cx_s, yc+r_exp) = top centre.
         sample_angles = np.array([
-            math.radians(180 - i * (360.0 / n_points))
-            for i in range(n_points)
+            math.radians(90 + i * (360.0 / self.n_points))
+            for i in range(self.n_points)
         ])
 
-        cx_s     = 0.0
+        # X-centre: use the fitted xc so contour is truly centred on the trunk.
+        # sample_x is in the SAME coordinate space as the raw scan (before
+        # the display-only xc subtraction that happens inside _plot).
+        cx_s     = xc
         sample_x = cx_s + r_exp * np.cos(sample_angles)
         sample_y = yc   + r_exp * np.sin(sample_angles)
-        sample_z = np.full(n_points, 10)
+        sample_z = np.full(self.n_points, self.z_height_mm)
 
-        print(f"[{self.name}] Expanded r={r_exp:.2f} mm | centre (0, {yc:.2f}) | {n_points} pts CCW")
+        print(
+            f"[{self.name}] Expanded r={r_exp:.2f} mm | "
+            f"centre=(0, {yc:.2f}) | {self.n_points} pts"
+        )
 
-        plot_b64 = self._plot(pts, xc, yc, r, sigma,
-                              r_exp, cx_s, yc, sample_x, sample_y)
+        # ── 7. Plot ──────────────────────────────────────────────────────
+        plot_b64 = self._plot(
+            pts, xc, yc, r, sigma,
+            r_exp, cx_s, yc,
+            sample_x, sample_y
+        )
 
+        # ── 8. Build point list ──────────────────────────────────────────
         points = [
-            {"x": float(sample_x[i]), "y": float(sample_y[i]), "z": float(sample_z[i])}
-            for i in range(n_points)
+            {"x": float(sample_x[i]),
+             "y": float(sample_y[i]),
+             "z": float(sample_z[i])}
+            for i in range(self.n_points)
         ]
-        return points, r_exp, plot_b64
+
+        # ── 9. Save red contour points to CSV ────────────────────────────
+        abs_output   = os.path.abspath(self.output_path)
+        contour_path = os.path.splitext(abs_output)[0] + '_contour_points.csv'
+
+        # Close any existing file handle by writing to a temp file first,
+        # then replacing — avoids PermissionError if the CSV is open in Excel.
+        tmp_path = contour_path + '.tmp'
+        with open(tmp_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['x', 'y', 'z'])
+            for p in points:
+                w.writerow([f"{p['x']:.4f}", f"{p['y']:.4f}", f"{p['z']:.4f}"])
+
+        # Atomic replace (works on Windows too)
+        if os.path.exists(contour_path):
+            os.remove(contour_path)
+        os.rename(tmp_path, contour_path)
+
+        print(f"[{self.name}] Contour points saved → {contour_path} ({len(points)} pts)")
+
+        return points, float(r_exp), plot_b64
 
     # ------------------------------------------------------------------ #
-    #  stop()                                                             #
+    #  INTERNAL                                                            #
     # ------------------------------------------------------------------ #
-    def stop(self):
-        self.running = False
 
-    # ------------------------------------------------------------------ #
-    #  Plot → base64 PNG                                                  #
-    # ------------------------------------------------------------------ #
-    def _plot(self, points, xc, yc, r, sigma,
-              r_exp, cx_s, yc_s, sample_x, sample_y):
-        xs = points[:, 0] - xc
-        ys = points[:, 1]
+    def _scan_worker(self):
+        """Runs the actual RPLidar scan. Called by both sync and async paths."""
+        try:
+            self._lidar = RPLidar(self.port, baudrate=BAUDRATE, timeout=3)
+            self._lidar.start_motor()
+            time.sleep(MOTOR_STARTUP_DELAY)
+
+            # Auto-detect distance if not provided
+            if self.auto_detect or self.distance_cm is None:
+                dist_mm = self._detect_distance()
+                if dist_mm is None:
+                    raise RuntimeError(
+                        "Auto-detection failed — no front points found. "
+                        "Is the sensor pointing at the object?"
+                    )
+                self.distance_cm = dist_mm / 10
+                self._lidar.stop()
+                time.sleep(0.5)
+
+            # Compute angular window
+            half = (
+                math.degrees(math.atan(self.radius_cm / self.distance_cm))
+                + self.safety_margin_deg
+            )
+            min_ang = (360 - half) % 360
+            max_ang = half % 360
+            wraps   = min_ang > max_ang
+
+            buf, circle_params, scan_count, last_upd = [], None, 0, 0
+            t0 = time.time()
+
+            for s in self._lidar.iter_scans(max_buf_meas=50000):
+                if (time.time() - t0) >= self.scan_duration_sec:
+                    break
+
+                # Layer 1: angle filter
+                if wraps:
+                    pts = [(q, a, d) for q, a, d in s if d > 0 and (a >= min_ang or a <= max_ang)]
+                else:
+                    pts = [(q, a, d) for q, a, d in s if d > 0 and min_ang <= a <= max_ang]
+
+                # Layer 2: circle filter (once we have a fit)
+                if circle_params and pts:
+                    cx, cy, cr = circle_params
+                    pts = [
+                        (q, a, d) for q, a, d in pts
+                        if abs(
+                            math.sqrt(
+                                (d * math.cos(math.radians(a)) - cx) ** 2 +
+                                (d * math.sin(math.radians(a)) - cy) ** 2
+                            ) - cr
+                        ) <= self.circle_tolerance_mm
+                    ]
+
+                # Buffer management — keep best-quality points
+                for q, a, d in pts:
+                    if len(buf) < MAX_POINTS:
+                        buf.append((q, a, d))
+                    else:
+                        worst = min(buf, key=lambda p: p[0])
+                        if q > worst[0]:
+                            buf.remove(worst)
+                            buf.append((q, a, d))
+
+                # Refresh circle estimate every 5 scans
+                if scan_count - last_upd >= 5 and len(buf) >= 10:
+                    cart = [
+                        (d * math.cos(math.radians(a)),
+                         d * math.sin(math.radians(a)))
+                        for _, a, d in buf
+                    ]
+                    cp = self._fit_circle_ls(cart)
+                    if cp:
+                        circle_params = cp
+                    last_upd = scan_count
+
+                scan_count += 1
+
+            # Write CSV as (angle, distance, quality)
+            buf.sort(key=lambda p: p[1])
+            out_dir = os.path.dirname(self.output_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+
+            with open(self.output_path, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['angle', 'distance', 'quality'])
+                w.writerows((a, d, q) for q, a, d in buf)
+
+            print(f"[{self.name}] Scan saved → {self.output_path} ({len(buf)} pts)")
+            self.scan_status = 'done'
+            return True
+
+        except RPLidarException as e:
+            msg = f"RPLidar hardware error: {e}"
+            print(f"[{self.name}] {msg}")
+            self.scan_error  = msg
+            self.scan_status = 'error'
+            return False
+
+        except Exception as e:
+            import traceback
+            msg = traceback.format_exc()
+            print(f"[{self.name}] Scan failed:\n{msg}")
+            self.scan_error  = str(e)
+            self.scan_status = 'error'
+            return False
+
+        finally:
+            self._cleanup()
+
+    def _plot(self, points, xc, yc, r, sigma, r_exp, cx_s, yc_s, sample_x, sample_y):
+        # Use raw Cartesian coordinates throughout — no artificial shifts.
+        # Sensor is at origin (0,0); forward = +Y; right = +X.
+        # xc/yc from taubinSVD are the true bottle centre in sensor space.
+        xs_plot = points[:, 0]
+        ys_plot = points[:, 1]
 
         fig, ax = plt.subplots(figsize=(7, 7))
-        ax.scatter(xs, ys, s=6, color='steelblue', alpha=0.55, label='Scan points')
-        ax.add_patch(plt.Circle((0, yc), r, color='black', fill=False,
-                                linewidth=1.8, label=f'Fit  r={r:.1f} mm'))
-        ax.plot(0, yc, 'k+', markersize=10, label='Fit centre')
-        ax.add_patch(plt.Circle((cx_s, yc_s), r_exp, color='green', fill=False,
-                                linewidth=1.8, linestyle='--',
-                                label=f'Expanded  r={r_exp:.1f} mm'))
-        ax.plot(cx_s, yc_s, 'g+', markersize=10, label=f'Shifted centre (y={yc_s:.1f})')
-        ax.scatter(sample_x, sample_y, s=55, color='red', edgecolors='black',
-                   zorder=5, label=f'{len(sample_x)}-pt contour (0° CCW)')
-        ax.scatter(sample_x[0], sample_y[0], s=120, color='yellow',
-                   edgecolors='black', zorder=6, label='Start (0°)')
+
+        # Sensor origin marker
+        ax.plot(0, 0, 'bs', markersize=7, label='Sensor origin')
+
+        # Raw scan arc
+        ax.scatter(xs_plot, ys_plot,
+                   s=6, color='steelblue', alpha=0.7, label='Scan points')
+
+        # Fitted circle at true centre (xc, yc)
+        ax.add_patch(plt.Circle(
+            (xc, yc), r,
+            color='black', fill=False, linewidth=1.8,
+            label=f'Fit  r={r:.1f} mm'
+        ))
+        ax.plot(xc, yc, 'k+', markersize=10, label=f'Fit centre ({xc:.0f}, {yc:.0f})')
+
+        # Expanded circle at same centre
+        ax.add_patch(plt.Circle(
+            (cx_s, yc_s), r_exp,
+            color='green', fill=False, linewidth=1.8, linestyle='--',
+            label=f'Expanded  r={r_exp:.1f} mm'
+        ))
+        ax.plot(cx_s, yc_s, 'g+', markersize=10,
+                label=f'Expanded centre ({cx_s:.0f}, {yc_s:.0f})')
+
+        # 36 contour sample points
+        ax.scatter(sample_x, sample_y,
+                   s=55, color='red', edgecolors='black', zorder=5,
+                   label=f'{len(sample_x)}-pt contour')
+        # Start point at 90° = top of circle
+        ax.scatter(sample_x[0], sample_y[0],
+                   s=120, color='yellow', edgecolors='black', zorder=6,
+                   label='Start pt (90°)')
 
         ax.set_aspect('equal', adjustable='datalim')
         ax.axvline(0, color='grey', linewidth=0.6, alpha=0.4)
-        ax.set_title(f'Fit r={r:.2f} mm  →  Expanded r={r_exp:.2f} mm   σ={sigma:.3f} mm')
+        ax.set_title(
+            f'Scan curve  →  Fit r={r:.2f} mm  →  '
+            f'Expanded r={r_exp:.2f} mm   σ={sigma:.4f} mm'
+        )
         ax.set_xlabel('X (mm)')
         ax.set_ylabel('Y (mm)')
         ax.legend(fontsize=8, loc='upper right')
@@ -274,301 +370,62 @@ class LidarThread(threading.Thread):
 
         buf = io.BytesIO()
         fig.savefig(buf, format='png', dpi=120)
-        fig.savefig(DEFAULT_RAW_IMG, format='png', dpi=120)
         plt.close(fig)
         buf.seek(0)
         return base64.b64encode(buf.read()).decode('utf-8')
 
-    # ------------------------------------------------------------------ #
-    #  Private helpers                                                    #
-    # ------------------------------------------------------------------ #
-    def _connect_lidar(self, port, max_retries=3):
-        for attempt in range(max_retries):
-            try:
-                # Full teardown before each attempt
-                if self._lidar:
-                    try:
-                        self._lidar.stop()
-                        self._lidar.stop_motor()
-                        self._lidar.disconnect()
-                    except Exception:
-                        pass
-                    self._lidar = None
-                    time.sleep(1.0)  # let serial port fully release
-
-                self._lidar = RPLidar(port, baudrate=BAUDRATE, timeout=3)
-
-                # Flush stale bytes that cause descriptor mismatch
-                if hasattr(self._lidar, '_serial') and self._lidar._serial:
-                    self._lidar._serial.reset_input_buffer()
-                    self._lidar._serial.reset_output_buffer()
-
-                self._lidar.stop()       # reset any in-progress command
-                time.sleep(0.3)
-                self._lidar.start_motor()
-                time.sleep(MOTOR_STARTUP_DELAY)
-
-                # Handshake — confirms clean comms before iter_scans
-                info = self._lidar.get_info()
-                print(f"[{self.name}] Connected (attempt {attempt+1}): {info}")
-                return True
-
-            except RPLidarException as e:
-                print(f"[{self.name}] Connect attempt {attempt+1}/{max_retries} failed: {e}")
-                time.sleep(2.0)
-
-        return False
-
-    def _detect_distance(self, num_scans=5, min_quality=10, front_angle_tolerance=10):
-        def is_front_facing(angle):
-            """Check if angle is within tolerance of 0° (front)."""
-            # Handle angles near 0° (can be 359-360 or 0-1)
-            if angle <= front_angle_tolerance:
-                return True
-            if angle >= (360 - front_angle_tolerance):
-                return True
-            return False
-        front_dist, front_angles, scan_count = [], [], 0
-
-        for scan in self._lidar.iter_scans(max_buf_meas=5000):
-            scan_count += 1
-            
-            # Collect points in front-facing region with good quality
-            valid_points_this_scan = 0
-            for quality, angle, distance in scan:
-                if quality >= min_quality and is_front_facing(angle):
-                    front_dist.append(distance)
-                    front_angles.append(angle)
-                    valid_points_this_scan += 1
-            
-            print(f"  Scan {scan_count}/{num_scans}: Found {valid_points_this_scan} valid points in front")
-            
-            if scan_count >= num_scans:
+    def _detect_distance(self):
+        tol, dists, count = self.safety_margin_deg, [], 0
+        for s in self._lidar.iter_scans(max_buf_meas=5000):
+            count += 1
+            dists += [
+                d for q, a, d in s
+                if q >= 10 and d > 0 and (a <= tol or a >= 360 - tol)
+            ]
+            if count >= 5:
                 break
-        if not front_dist:
-            raise RuntimeError("No valid objects detected in front!")
-        
-        avg_dist = statistics.mean(front_dist)
-        median_dist = statistics.median(front_dist)
-        min_dist = min(front_dist)
-        max_dist = max(front_dist)
-        std_dev = statistics.stdev(front_dist) if len(front_dist) > 1 else 0
-        
-        # print(f"  Average distance: {avg_dist:.2f} mm ({avg_dist/10:.2f} cm)")
-        # print(f"  Median distance: {median_dist:.2f} mm ({median_dist/10:.2f} cm)")
-        # print(f"  Minimum distance: {min_dist:.2f} mm ({min_dist/10:.2f} cm)")
-
-        normalized_angles = []
-        for angle in front_angles:
-            if angle > 180:
-                normalized_angles.append(angle - 360)
-            else:
-                normalized_angles.append(angle)
-        
-        avg_angle = statistics.mean(normalized_angles)
-        if avg_angle < 0:
-            avg_angle += 360
-
-        return avg_dist, avg_angle
+        return statistics.median(dists) if dists else None
 
     def _load_csv(self, path):
-        """
-        Handles both original scanner format (angle, distance, quality)
-        and lidar_worker format (quality, angle, distance).
-        """
-        qualities, angles, distances = [], [], []
+        angles, distances, qualities = [], [], []
         with open(path, 'r', encoding='latin-1') as f:
-            reader = csv.reader(f)
-            header = None
-            for row in reader:
-                if not row or row[0].startswith('#') or row[0].strip() == '':
+            for row in csv.reader(f):
+                # Skip blank, comment, and header rows
+                if not row:
                     continue
-
-                # Detect header row — any row whose first cell is non-numeric
-                try:
-                    float(row[0])
-                except ValueError:
-                    header = [col.strip().lower() for col in row]
+                if row[0].startswith('#') or row[0].strip() in ('angle', 'quality'):
                     continue
-
-                # Parse data row according to detected header
                 try:
-                    if header and 'angle' in header:
-                        ai = header.index('angle')
-                        di = header.index('distance')
-                        qi = header.index('quality')
-                        angles.append(float(row[ai]))
-                        distances.append(float(row[di]))
-                        qualities.append(int(float(row[qi])))
-                    else:
-                        # Fallback: assume lidar_worker order (quality, angle, distance)
-                        qualities.append(int(float(row[0])))
-                        angles.append(float(row[1]))
-                        distances.append(float(row[2]))
+                    # CSV written as (angle, distance, quality)
+                    angles.append(float(row[0]))
+                    distances.append(float(row[1]))
+                    qualities.append(int(row[2]))
                 except (ValueError, IndexError):
                     continue
+        return angles, distances, qualities
 
-        return qualities, angles, distances
+    @staticmethod
+    def _fit_circle_ls(cart_points):
+        try:
+            pts = np.array(cart_points)
+            x, y = pts[:, 0], pts[:, 1]
+            u, v = x - x.mean(), y - y.mean()
+            Suu = (u ** 2).sum()
+            Svv = (v ** 2).sum()
+            Suv = (u * v).sum()
+            A = np.array([[Suu, Suv], [Suv, Svv]])
+            if abs(np.linalg.det(A)) < 1e-10:
+                return None
+            B  = np.array([
+                0.5 * ((u ** 3).sum() + (u * v ** 2).sum()),
+                0.5 * ((v ** 3).sum() + (u ** 2 * v).sum()),
+            ])
+            uc, vc = np.linalg.solve(A, B)
+            r = math.sqrt(uc ** 2 + vc ** 2 + (Suu + Svv) / len(x))
+            return uc + x.mean(), vc + y.mean(), r
+        except Exception:
+            return None
 
-    # @staticmethod
-    # def _fit_circle_ls(cart_points):
-    #     try:
-    #         pts = np.array(cart_points)
-    #         x, y = pts[:, 0], pts[:, 1]
-    #         u, v = x - x.mean(), y - y.mean()
-    #         Suu, Svv, Suv = (u**2).sum(), (v**2).sum(), (u*v).sum()
-    #         A = np.array([[Suu, Suv], [Suv, Svv]])
-    #         if abs(np.linalg.det(A)) < 1e-10: return None
-    #         B  = np.array([0.5*((u**3).sum() + (u*v**2).sum()),
-    #                        0.5*((v**3).sum() + (u**2*v).sum())])
-    #         uc, vc = np.linalg.solve(A, B)
-    #         r = math.sqrt(uc**2 + vc**2 + (Suu + Svv) / len(x))
-    #         return uc + x.mean(), vc + y.mean(), r
-    #     except Exception:
-    #         return None
-    @staticmethod
-    def _filter_scan_data(scan, min_angle, max_angle):
-        """Filter scan data to only include points within the specified angle range."""
-        filtered = []
-        
-        # Handle wrap-around case (e.g., 350° to 10°)
-        wraps_around = min_angle > max_angle
-        
-        for quality, angle, distance in scan:
-            if wraps_around:
-                # Check if angle is either >= min_angle OR <= max_angle
-                if angle >= min_angle or angle <= max_angle:
-                    filtered.append((quality, angle, distance))
-            else:
-                # Normal case: check if min_angle <= angle <= max_angle
-                if min_angle <= angle <= max_angle:
-                    filtered.append((quality, angle, distance))
-        
-        return filtered
-    @staticmethod
-    def _filter_by_circle(points, expected_radius_mm, tolerance_mm=50, min_points=10):
-        def polar_to_cartesian(angle_deg, distance_mm):
-            """Convert polar coordinates to Cartesian (x, y) in mm."""
-            angle_rad = math.radians(angle_deg)
-            x = distance_mm * math.cos(angle_rad)
-            y = distance_mm * math.sin(angle_rad)
-            return x, y
-        def fit_circle(points):
-            """
-            Fit a circle to a set of (x, y) points using least squares.
-            
-            Args:
-                points: List of (x, y) tuples in mm
-                
-            Returns:
-                (center_x, center_y, radius) or None if fitting fails
-            """
-            if len(points) < 3:
-                return None
-            
-            try:
-                # Convert to numpy arrays
-                points = np.array(points)
-                x = points[:, 0]
-                y = points[:, 1]
-                
-                # Calculate coordinates of the barycenter
-                x_m = np.mean(x)
-                y_m = np.mean(y)
-                
-                # Calculate the reduced coordinates
-                u = x - x_m
-                v = y - y_m
-                
-                # Linear system for circle fitting
-                Suv = np.sum(u * v)
-                Suu = np.sum(u ** 2)
-                Svv = np.sum(v ** 2)
-                Suuv = np.sum(u ** 2 * v)
-                Suvv = np.sum(u * v ** 2)
-                Suuu = np.sum(u ** 3)
-                Svvv = np.sum(v ** 3)
-                
-                # Solving the linear system
-                A = np.array([[Suu, Suv], [Suv, Svv]])
-                B = np.array([0.5 * (Suuu + Suvv), 0.5 * (Svvv + Suuv)])
-                
-                if np.linalg.det(A) == 0:
-                    return None
-                    
-                uc, vc = np.linalg.solve(A, B)
-                
-                # Calculate circle parameters
-                center_x = uc + x_m
-                center_y = vc + y_m
-                radius = np.sqrt(uc**2 + vc**2 + (Suu + Svv) / len(x))
-                
-                return center_x, center_y, radius
-            except:
-                return None
-        def distance_to_circle(point, circle_params):
-            """
-            Calculate the perpendicular distance from a point to a circle.
-            
-            Args:
-                point: (x, y) tuple in mm
-                circle_params: (center_x, center_y, radius) tuple in mm
-                
-            Returns:
-                Distance in mm (positive if outside circle, negative if inside)
-            """
-            if circle_params is None:
-                return 0
-            
-            center_x, center_y, radius = circle_params
-            x, y = point
-            
-            # Distance from point to center
-            dist_to_center = math.sqrt((x - center_x)**2 + (y - center_y)**2)
-            
-            # Distance to circle perimeter
-            deviation = abs(dist_to_center - radius)
-            
-            return deviation
-        """
-        Filter points based on how well they fit a circle.
-        
-        Args:
-            points: List of (quality, angle, distance) tuples
-            expected_radius_mm: Expected radius of the object in mm
-            tolerance_mm: Maximum allowed deviation from circle in mm
-            
-        Returns:
-            filtered_points: List of (quality, angle, distance) tuples that fit the circle
-            circle_params: Fitted circle parameters (center_x, center_y, radius)
-        """
-        if len(points) < min_points:
-            # Not enough points yet, return all points
-            return points, None
-        
-        # Convert polar to Cartesian
-        cartesian_points = [polar_to_cartesian(angle, distance) 
-                        for quality, angle, distance in points]
-        
-        # Fit circle to points
-        circle_params = fit_circle(cartesian_points)
-        
-        if circle_params is None:
-            # Circle fitting failed, return all points
-            return points, None
-        
-        center_x, center_y, fitted_radius = circle_params
-        
-        # Filter points based on deviation from fitted circle
-        filtered = []
-        for i, (quality, angle, distance) in enumerate(points):
-            x, y = cartesian_points[i]
-            deviation = distance_to_circle((x, y), circle_params)
-            
-            if deviation <= tolerance_mm:
-                filtered.append((quality, angle, distance))
-        
-        return filtered, circle_params
     def _cleanup(self):
         if self._lidar:
             try:
@@ -577,15 +434,36 @@ class LidarThread(threading.Thread):
                 self._lidar.disconnect()
             except Exception:
                 pass
+            self._lidar = None
 
 
-# ── Standalone test ───────────────────────────────────────────────────────────
+# ------------------------------------------------------------------ #
+#  Standalone CLI                                                       #
+# ------------------------------------------------------------------ #
 if __name__ == "__main__":
-    worker = LidarThread("LidarWorker-1")
-    points, r_exp, plot_b64 = worker.process_data('data_scan_circle_filtered_6.csv')
+    worker = LidarThread("LidarWorker-CLI", {
+        'radius_cm':         5.0,
+        'distance_cm':       None,
+        'safety_margin_deg': 5,
+        'scan_duration_sec': 30,
+        'circle_tolerance_mm': 50,
+        'expand_mm':         100.0,
+        'n_points':          36,
+        'z_height_mm':       10.0,
+        'port':              'COM5',
+    })
 
-    if r_exp is not None:
-        print(f"r_exp={r_exp:.2f} mm  |  {len(points)} contour points")
+    import sys
+    csv_path = sys.argv[1] if len(sys.argv) > 1 else 'raw_data.csv'
+
+    try:
+        points, r_exp, plot_b64 = worker.process_data(csv_path)
+        print(f"r_exp = {r_exp:.2f} mm")
+        print(f"Points ({len(points)} total):")
+        for i, p in enumerate(points):
+            print(f"  [{i:02d}]  x={p['x']:8.2f}  y={p['y']:8.2f}  z={p['z']:.1f}")
         with open('result_plot.png', 'wb') as f:
             f.write(base64.b64decode(plot_b64))
         print("Plot saved → result_plot.png")
+    except ValueError as e:
+        print(f"Processing error: {e}")
