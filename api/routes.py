@@ -69,6 +69,218 @@ def hello():
 def status():
     return jsonify({"status": "All systems nominal"}), 200
 
+@api_blueprint.route('/pipeline/run', methods=['POST'])
+def pipeline_run():
+    """
+    Full automated measurement pipeline:
+ 
+    Step 1 — LiDAR scan + process → contour points
+    Step 2 — For each point (up to max_points):
+               a. Move arm to point   → wait DONE
+               b. TOF reading         → wait DATA: → ACK
+               c. VNA scan            → wait file written → ACK
+    Step 3 — Generate B-Scan image from TOF data
+    Step 4 — Return results
+ 
+    Body (all optional except ports which must be set via /init first):
+    {
+        "max_points":  36       ← max contour points to visit (default 36)
+    }
+ 
+    Response:
+    {
+        "msg":           "Pipeline complete",
+        "points_total":  36,
+        "points_done":   36,
+        "points_skipped": 0,
+        "results": [
+            {
+                "index":    1,
+                "x":        12.3,
+                "y":        4.5,
+                "z":        0.0,
+                "tof_cm":   18.5,
+                "tof_ack":  true,
+                "vna_file": "data/vna_logs/1.csv",
+                "vna_ack":  true,
+                "status":   "complete"
+            },
+            ...
+        ],
+        "bscan_image": "<base64 PNG>"
+    }
+    """
+    import time
+ 
+    lidar_worker = current_app.config.get('LIDAR_WORKER')
+    robot_worker = current_app.config.get('ROBOT_WORKER')
+    vna_worker   = current_app.config.get('VNA_WORKER')
+ 
+    if not lidar_worker:
+        return jsonify({"error": "LIDAR_WORKER not initialized"}), 500
+    if not robot_worker:
+        return jsonify({"error": "ROBOT_WORKER not initialized"}), 500
+    if not robot_worker.port:
+        return jsonify({"error": "Robot serial not connected — call /init first"}), 400
+ 
+    cfg = current_app.config.get('SCAN_CONFIG')
+    if not cfg:
+        return jsonify({"error": "Scan config missing — call /init first"}), 400
+ 
+    data       = request.get_json() or {}
+    max_points = int(data.get("max_points", 36))
+ 
+    MM_TO_CM   = 0.1
+    vna_folder = current_app.config.get('VNA_LOGS', 'data/vna_logs')
+    tof_path   = os.path.join(current_app.config.get('TOF_RECORD', 'data/tof_logs'), 'tof.csv')
+ 
+    # ── STEP 1: LiDAR scan ────────────────────────────────
+    print("[Pipeline] Step 1 — LiDAR scan starting...")
+    lidar_done = threading.Event()
+    lidar_worker.scan(
+        cfg["port"],
+        cfg["radius_mm"],
+        cfg["distance_cm"],
+        cfg["safety_margin_deg"],
+        cfg["scan_duration_sec"],
+        cfg["circle_toleration_mm"],
+        done_event=lidar_done
+    )
+    lidar_done.wait()
+    print("[Pipeline] Step 1 — LiDAR scan complete")
+ 
+    # ── STEP 1b: Process LiDAR data → contour points ──────
+    lidar_path = os.path.join(current_app.config.get('LIDAR_DATA'), 'raw.csv')
+    points, r_exp, lidar_img = lidar_worker.process_data(path=lidar_path)
+ 
+    if not points:
+        return jsonify({"error": "LiDAR scan returned no contour points"}), 500
+ 
+    # Limit to max_points
+    points = points[:max_points]
+    total  = len(points)
+    print(f"[Pipeline] {total} contour points (max={max_points})")
+ 
+    # ── Prepare TOF log ───────────────────────────────────
+    os.makedirs(os.path.dirname(tof_path), exist_ok=True)
+    open(tof_path, 'w').close()   # clear before new run
+    os.makedirs(vna_folder, exist_ok=True)
+ 
+    # ── STEP 2+3: Point loop ──────────────────────────────
+    results  = []
+    skipped  = 0
+ 
+    for i, pt in enumerate(points):
+        x_cm = pt["x"] * MM_TO_CM
+        y_cm = pt["y"] * MM_TO_CM
+        z_cm = pt.get("z", 0) * MM_TO_CM
+ 
+        print(f"\n[Pipeline] ── Point {i+1}/{total} ──")
+        print(f"[Pipeline] Target: x={x_cm:.2f} y={y_cm:.2f} z={z_cm:.2f} cm")
+ 
+        result = {
+            "index":    i + 1,
+            "x":        round(x_cm, 3),
+            "y":        round(y_cm, 3),
+            "z":        round(z_cm, 3),
+            "tof_cm":   None,
+            "tof_ack":  False,
+            "vna_file": None,
+            "vna_ack":  False,
+            "status":   "pending"
+        }
+ 
+        # ── 2a. Move arm ───────────────────────────────────
+        try:
+            robot_worker._move_arm(x_cm, y_cm, z_cm)
+            robot_worker.position = {"x": x_cm, "y": y_cm, "z": z_cm}
+            print(f"[Pipeline] ✓ Arm reached point {i+1}")
+        except RuntimeError as e:
+            print(f"[Pipeline] ✗ Move failed: {e} — skipping point {i+1}")
+            result["status"] = f"skipped: {e}"
+            results.append(result)
+            skipped += 1
+            continue
+ 
+        # ── 2b. TOF reading ────────────────────────────────
+        try:
+            tof_cm = robot_worker._read_tof_serial()
+ 
+            # Log to CSV
+            idx = robot_worker._get_next_tof_index(tof_path)
+            with open(tof_path, 'a', newline='') as f:
+                import csv
+                csv.writer(f).writerow([idx, tof_cm])
+ 
+            result["tof_cm"]  = round(tof_cm, 3)
+            result["tof_ack"] = True
+            print(f"[Pipeline] ✓ TOF ACK — {tof_cm:.2f} cm")
+ 
+        except Exception as e:
+            print(f"[Pipeline] ✗ TOF failed: {e}")
+            # Non-fatal — continue to VNA
+ 
+        # ── 2c. VNA scan ───────────────────────────────────
+        if vna_worker:
+            vna_filepath = os.path.join(vna_folder, f"{i + 1}.csv")
+            try:
+                vna_done = threading.Event()
+                vna_worker.collect_data(vna_filepath, done_event=vna_done)
+ 
+                if not vna_done.wait(timeout=30):
+                    raise RuntimeError("VNA collect_data() timed out")
+ 
+                if not os.path.exists(vna_filepath):
+                    raise RuntimeError("VNA file not written after completion")
+ 
+                result["vna_file"] = vna_filepath
+                result["vna_ack"]  = True
+                print(f"[Pipeline] ✓ VNA ACK — {vna_filepath}")
+ 
+            except Exception as e:
+                print(f"[Pipeline] ✗ VNA failed: {e}")
+                # Non-fatal — continue to next point
+        else:
+            print(f"[Pipeline] VNA worker not available — skipping VNA for point {i+1}")
+ 
+        # ── Mark point status ──────────────────────────────
+        tof_ok = result["tof_ack"]
+        vna_ok = result["vna_ack"] or vna_worker is None
+ 
+        if tof_ok and vna_ok:
+            result["status"] = "complete"
+        elif tof_ok and not vna_ok:
+            result["status"] = "partial: VNA failed"
+        elif not tof_ok and vna_ok:
+            result["status"] = "partial: TOF failed"
+        else:
+            result["status"] = "partial: TOF and VNA failed"
+ 
+        results.append(result)
+        print(f"[Pipeline] Point {i+1} → {result['status']}")
+ 
+    # ── STEP 4: Generate B-Scan image ─────────────────────
+    print("\n[Pipeline] Step 4 — Generating B-Scan image...")
+    x_trunk, y_trunk, bscan_img = robot_worker.process_data(path=tof_path)
+ 
+    # ── Summary ───────────────────────────────────────────
+    complete = sum(1 for r in results if r["status"] == "complete")
+    partial  = sum(1 for r in results if r["status"].startswith("partial"))
+ 
+    print(f"[Pipeline] ── Complete ──")
+    print(f"[Pipeline] {complete}/{total} complete, {partial} partial, {skipped} skipped")
+ 
+    return jsonify({
+        "msg":             "Pipeline complete",
+        "points_total":    total,
+        "points_done":     complete,
+        "points_partial":  partial,
+        "points_skipped":  skipped,
+        "lidar_r_exp":     r_exp,
+        "results":         results,
+        "bscan_image":     bscan_img
+    }), 200
+
 #======Lidar routes===========================================================
 
 @api_blueprint.route('/lidar/scan', methods=['POST'])
@@ -635,6 +847,7 @@ def vna_collect():
         "msg":      "A-scan saved",
         "filename": filepath,
     }), 200
+ 
  
  
 # @api_blueprint.route('/vna/bscan', methods=['POST'])
