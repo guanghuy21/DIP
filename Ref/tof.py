@@ -33,7 +33,7 @@ with open(OUTPUT_FILE, "w", newline="") as f:
                 cmd_buffer += ch
 
         # Read from Arduino
-        print(cmd_buffer)
+        # print(cmd_buffer)
         if ser.in_waiting:
             line = ser.readline().decode(errors="ignore").strip()
             print(line)

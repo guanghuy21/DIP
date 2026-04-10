@@ -32,19 +32,23 @@ class RobotThread(threading.Thread):
     Both are connected to the same Arduino Mega — one shared serial port.
 
     Serial Commands sent to Arduino:
-        x,y,z        → Move arm (IK solved on Arduino)
-        TOF_START    → Take one TOF reading
-        STATUS       → Get motor positions + TOF state
+        x,y,z            → Move arm (IK solved on Arduino)
+        TOF_START         → Take one TOF reading
+        SET_OFFSET:<val>  → Set LiDAR-to-J1 offset in cm (sent once at /init)
+        SET_TRUNK:<x>,<y> → Set trunk centre in J1 frame in cm (sent once at /init)
+        STATUS            → Get motor positions + TOF state
 
     Arduino replies:
-        MOVING t1,t2,t3  → IK solved, motors starting
-        DONE             → All motors stopped
-        UNREACHABLE      → IK failed
-        DATA:millis,mm   → TOF reading result
-        MSG:...          → Informational, ignored by worker
+        MOVING t1,t2,t3   → IK solved, motors starting
+        DONE              → All motors stopped
+        UNREACHABLE       → IK failed
+        DATA:millis,mm    → TOF reading result
+        ACK_OFFSET:<val>  → Offset confirmed
+        ACK_TRUNK:<x>,<y> → Trunk centre confirmed
+        MSG:...           → Informational, ignored by worker
     """
 
-    def __init__(self, name, port = None, baud=BAUD_RATE, tof_path=DEFAULT_TOF_FILE):
+    def __init__(self, name, port=None, baud=BAUD_RATE, tof_path=DEFAULT_TOF_FILE):
         super().__init__(name=name)
         self.daemon       = True
 
@@ -77,6 +81,11 @@ class RobotThread(threading.Thread):
 
     def run(self):
         print(f"[{self.name}] Robot controller active...")
+
+        if self.port:
+            print(f"[{self.name}] Auto-connecting to {self.port}...")
+            self._connect(self.port)
+
         while True:
             if self.port and (self._serial is None or not self._serial.is_open):
                 print(f"[{self.name}] Serial lost — reconnecting...")
@@ -93,7 +102,6 @@ class RobotThread(threading.Thread):
             self._serial = serial.Serial(port, self._baud, timeout=TIMEOUT_SEC)
             time.sleep(2)  # Arduino resets on serial open
 
-            # Drain boot messages until MSG:READY
             deadline = time.time() + 4
             while time.time() < deadline:
                 if self._serial.in_waiting:
@@ -137,6 +145,81 @@ class RobotThread(threading.Thread):
                 return line
 
             raise RuntimeError(f"Timeout waiting for response to: {cmd}")
+
+    # ──────────────────────────────────────────────────────
+    # INIT COMMANDS  (sent once by /init before pipeline)
+    # ──────────────────────────────────────────────────────
+
+    def set_lidar_offset(self, offset_cm: float, timeout: float = 3.0) -> bool:
+        """
+        Send SET_OFFSET:<val> to Arduino and wait for ACK_OFFSET.
+
+        offset_cm : distance from LiDAR to J1 axis in cm.
+                    Positive = LiDAR is closer to tree than J1.
+                    The lidar_worker already applies this when generating
+                    waypoints, so this call is informational for the Arduino
+                    (used in STATUS replies).
+
+        Must be called after connect() and before the pipeline starts.
+        """
+        if self._serial is None or not self._serial.is_open:
+            raise RuntimeError("Serial not open — call connect(port) first")
+
+        cmd = f"SET_OFFSET:{offset_cm:.2f}\n"
+        with self._serial_lock:
+            self._serial.write(cmd.encode('utf-8'))
+            self._serial.flush()
+            print(f"[{self.name}] >> SET_OFFSET:{offset_cm:.2f}")
+
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                line = self._serial.readline().decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+                print(f"[{self.name}] << {line}")
+                if line.startswith("ACK_OFFSET:"):
+                    confirmed = float(line.split(":")[1])
+                    print(f"[{self.name}] Offset confirmed: {confirmed:.2f} cm")
+                    return True
+
+        print(f"[{self.name}] WARNING: No ACK_OFFSET received")
+        return False
+
+    def set_trunk_centre(self, cx_cm: float, cy_cm: float, timeout: float = 3.0) -> bool:
+        """
+        Send SET_TRUNK:<cx>,<cy> to Arduino and wait for ACK_TRUNK.
+
+        cx_cm, cy_cm : trunk centre position in J1 frame, cm.
+                       Obtained from lidar_worker.process_data() which returns
+                       trunk_centre = {"cx_mm": ..., "cy_mm": ...}.
+                       Divide by 10 to convert mm → cm before passing here.
+
+        This MUST be sent before any move commands — the Arduino rejects
+        moves with ERR:TRUNK_NOT_SET if this has not been received.
+        """
+        if self._serial is None or not self._serial.is_open:
+            raise RuntimeError("Serial not open — call connect(port) first")
+
+        cmd = f"SET_TRUNK:{cx_cm:.2f},{cy_cm:.2f}\n"
+        with self._serial_lock:
+            self._serial.write(cmd.encode('utf-8'))
+            self._serial.flush()
+            print(f"[{self.name}] >> SET_TRUNK:{cx_cm:.2f},{cy_cm:.2f}")
+
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                line = self._serial.readline().decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+                print(f"[{self.name}] << {line}")
+                if line.startswith("ACK_TRUNK:"):
+                    parts = line.split(":")[1].split(",")
+                    print(f"[{self.name}] Trunk centre confirmed: "
+                          f"({float(parts[0]):.2f}, {float(parts[1]):.2f}) cm")
+                    return True
+
+        print(f"[{self.name}] WARNING: No ACK_TRUNK received")
+        return False
 
     # ──────────────────────────────────────────────────────
     # SCARA COMMANDS
@@ -221,10 +304,10 @@ class RobotThread(threading.Thread):
                     parts = line[5:].split(",")
                     if len(parts) == 2:
                         distance_mm        = float(parts[1].strip())
-                        self.last_distance = distance_mm   # store in mm
+                        self.last_distance = distance_mm
                         self._log_tof_csv(distance_mm)
                         self._check_convergence([distance_mm])
-                        return distance_mm * MM_TO_CM      # return in cm
+                        return distance_mm * MM_TO_CM
 
                 if line == "MSG:OUT_OF_RANGE":
                     raise RuntimeError("TOF out of range")
@@ -286,14 +369,11 @@ class RobotThread(threading.Thread):
         """
         self.is_moving = True
         try:
-            # 1. Move — blocks until Arduino sends DONE
             self._move_arm(x, y, z)
             self.position = {"x": x, "y": y, "z": z}
 
-            # 2. TOF read over same serial port
             tof_cm = self._read_tof_serial()
 
-            # 3. Log to CSV
             idx = self._get_next_tof_index(path_tof)
             os.makedirs(
                 os.path.dirname(path_tof) if os.path.dirname(path_tof) else '.',
@@ -367,7 +447,6 @@ class RobotThread(threading.Thread):
                 print(f"[{self.name}] [{i+1}/{total}] "
                       f"x={x_cm:.2f} y={y_cm:.2f} z={z_cm:.2f} cm", end="  ")
 
-                # Move
                 try:
                     self._move_arm(x_cm, y_cm, z_cm)
                     self.position = {"x": x_cm, "y": y_cm, "z": z_cm}
@@ -377,7 +456,6 @@ class RobotThread(threading.Thread):
                     skipped += 1
                     continue
 
-                # TOF
                 try:
                     tof_cm = self._read_tof_serial()
                     idx = self._get_next_tof_index(path_tof)
@@ -412,7 +490,6 @@ class RobotThread(threading.Thread):
         """
         R = r_trajectory if r_trajectory else self.R_trajectory
 
-        # ── Load data ────────────────────────────────────
         if raw_data is not None:
             if raw_data and isinstance(raw_data[0], (int, float)):
                 A = [float(v) for v in raw_data]
@@ -442,7 +519,6 @@ class RobotThread(threading.Thread):
             x_trunk.append(r * np.cos(angles_rad[i]))
             y_trunk.append(r * np.sin(angles_rad[i]))
 
-        # ── Plot ─────────────────────────────────────────
         fig, ax = plt.subplots(figsize=(12, 12))
         ax.plot(0, 0, 'kx', markersize=12, markeredgewidth=2, label='Orbit center (0,0)')
         ax.plot(x_sensor, y_sensor, 'r--', alpha=0.6, label=f'TOF orbit (R={R})')

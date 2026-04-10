@@ -16,6 +16,8 @@ CIRCLE_FIT_TOLERANCE_MM = 50
 MIN_POINTS_FOR_CIRCLE_FIT = 10
 CIRCLE_UPDATE_INTERVAL  = 5
 
+DEFAULT_LIDAR_OFFSET_MM   = 50.0
+
 DEFAULT_RAW_PATH = os.path.join("data", "lidar_scan")
 DEFAULT_RAW_FILE = os.path.join(DEFAULT_RAW_PATH, "raw.csv")
 DEFAULT_RAW_IMG  = os.path.join(DEFAULT_RAW_PATH, "processed_lidar.png")
@@ -133,13 +135,29 @@ def calculate_scan_angle(radius_cm, distance_cm,
 
 class LidarThread(threading.Thread):
 
-    def __init__(self, name):
+    def __init__(self, name, lidar_offset_mm=DEFAULT_LIDAR_OFFSET_MM):
+        """
+        Parameters
+        ----------
+        name : str
+            Thread name shown in log output.
+        lidar_offset_mm : float
+            Distance from the LiDAR sensor to the robot's Joint 1 axis,
+            measured along the robot's forward direction (mm).
+            The LiDAR sits between J1 and the tree, so its measurements
+            are shorter than J1-frame distances by this amount.
+            This value is added to the fitted trunk centre y-coordinate
+            in process_data() to shift all waypoints into the J1 frame.
+            Can be overridden per process_data() call if needed.
+        """
         super().__init__(name=name)
-        self.daemon       = True
-        self.running      = True
-        self._lidar       = None
-        self._scan_kwargs = None
-        self._done_event  = threading.Event()
+        self.daemon            = True
+        self.running           = True
+        self._lidar            = None
+        self._scan_kwargs      = None
+        self._done_event       = threading.Event()
+        # ── offset initialised at construction time ───────────────────────
+        self._lidar_offset_mm  = lidar_offset_mm
 
     # ------------------------------------------------------------------ #
     #  run()                                                              #
@@ -322,28 +340,45 @@ class LidarThread(threading.Thread):
     # ------------------------------------------------------------------ #
     #  process_data() — unchanged from original worker                   #
     # ------------------------------------------------------------------ #
-    def process_data(self, path=DEFAULT_RAW_FILE):
+    def process_data(self, path=DEFAULT_RAW_FILE, lidar_offset_mm=None):
+        """
+        Process a raw LiDAR CSV and return contour waypoints in J1 frame.
+ 
+        Parameters
+        ----------
+        path : str
+            Path to the raw CSV written by scan().
+        lidar_offset_mm : float or None
+            Override the instance-level offset for this call only.
+            If None, uses self._lidar_offset_mm set at __init__ time.
+ 
+        Returns
+        -------
+        points       : list of dict  {"x": mm, "y": mm, "z": mm}
+        r_exp        : float  expanded scan radius in mm
+        plot_b64     : str    base64-encoded PNG
+        trunk_centre : dict   {"cx_mm": float, "cy_mm": float}  in J1 frame
+        """
+        # Resolve which offset to use — per-call override or instance default
+        offset_mm = lidar_offset_mm if lidar_offset_mm is not None \
+                    else self._lidar_offset_mm
+ 
         print(f"[{self.name}] Processing: {path}")
-
+        if offset_mm != 0.0:
+            print(f"[{self.name}] LiDAR→J1 offset: {offset_mm:.1f} mm  "
+                  f"(trunk centre shifted into J1 frame)")
+ 
         qualities, angles, distances = self._load_csv(path)
         if not angles:
             print(f"[{self.name}] No valid data found.")
-            return None, None, None
-
-        # Pre-filter: remove background noise that leaked through the scan
-        # window dead zones (scan window is wider than the true visible arc).
-        # Cylinder surface points cluster tightly in distance; background
-        # points (walls, floor) are much farther away.
-        # Keep only points within median +/- 2*std — tight enough to exclude
-        # background yet loose enough to keep the full cylinder arc.
+            return None, None, None, None
+ 
+        # Distance pre-filter (MAD-based, removes background noise)
         if len(distances) >= 10:
             import statistics as _st
             med = _st.median(distances)
-            # Use MAD (median absolute deviation) not stdev — stdev is blown
-            # out by far-away background points captured in the scan window
-            # dead zones, making a stdev-based window uselessly wide.
             mad = _st.median([abs(d - med) for d in distances])
-            mad = max(mad, 1.0)   # floor at 1mm so window is never zero-width
+            mad = max(mad, 1.0)
             lo, hi = med - 3.0 * mad, med + 3.0 * mad
             mask      = [lo <= d <= hi for d in distances]
             qualities = [q for q, m in zip(qualities,  mask) if m]
@@ -354,19 +389,19 @@ class LidarThread(threading.Thread):
                   f"window={lo:.0f}-{hi:.0f}mm)")
             if not distances:
                 print(f"[{self.name}] All points removed by pre-filter.")
-                return None, None, None
-
+                return None, None, None, None
+ 
         def norm(a):
             while a >  180: a -= 360
             while a <= -180: a += 360
             return a
         norm_ang = [norm(a) for a in angles]
-
+ 
         n   = max(5, len(distances) // 10)
         top = sorted(zip(distances, norm_ang))[:n]
         tw  = sum(1/d for d, _ in top)
         ca  = sum((1/d)*a for d, a in top) / tw
-
+ 
         corrected, xs, ys = [], [], []
         for na, dist in zip(norm_ang, distances):
             c = na - ca
@@ -374,40 +409,63 @@ class LidarThread(threading.Thread):
             rad = math.radians(c)
             xs.append(dist * math.sin(rad))
             ys.append(dist * math.cos(rad))
-
+ 
         idx = sorted(range(len(corrected)), key=lambda i: corrected[i])
         xs  = [xs[i] for i in idx]
         ys  = [ys[i] for i in idx]
-
+ 
         y_offset_mm = 50.0
         ys_shifted  = [y + y_offset_mm for y in ys]
-
+ 
         pts = np.array(list(zip(xs, ys_shifted)))
         xc, yc, r, sigma = taubinSVD(pts)
-        print(f"[{self.name}] Centre ({xc:.2f}, {yc:.2f}) mm | r={r:.2f} mm | σ={sigma:.3f}")
-
-        expand_mm = 100.0
+        print(f"[{self.name}] LiDAR frame — centre ({xc:.2f}, {yc:.2f}) mm | "
+              f"r={r:.2f} mm | σ={sigma:.3f}")
+ 
+        # ── Apply LiDAR→J1 offset ─────────────────────────────────────────
+        # The LiDAR is closer to the tree than J1 by offset_mm.
+        # Adding offset_mm to yc converts the trunk centre from the LiDAR
+        # frame to the J1 frame.  The x-axis is not affected.
+        yc_j1 = yc - offset_mm   # ← use resolved offset_mm, not raw parameter
+        cx_j1 = xc
+ 
+        print(f"[{self.name}] J1 frame    — centre ({cx_j1:.2f}, {yc_j1:.2f}) mm  "
+              f"(+{offset_mm:.1f} mm on Y)")
+ 
+        # ── Generate waypoints around J1-frame trunk centre ───────────────
+        expand_mm = 100.0   # gap from trunk surface to antenna tip
         n_points  = 36
         r_exp     = r + expand_mm
-
+ 
         sample_angles = np.array([
             math.radians(180 - i * (360.0 / n_points))
             for i in range(n_points)
         ])
-        cx_s     = 0.0
-        sample_x = cx_s + r_exp * np.cos(sample_angles)
-        sample_y = yc   + r_exp * np.sin(sample_angles)
+ 
+        # Use J1-frame centre (cx_j1, yc_j1) — not the old cx_s=0 / yc
+        sample_x = cx_j1 + r_exp * np.cos(sample_angles)
+        sample_y = yc_j1 + r_exp * np.sin(sample_angles)
         sample_z = np.full(n_points, 10)
-
-        print(f"[{self.name}] Expanded r={r_exp:.2f} mm | centre (0, {yc:.2f}) | {n_points} pts CCW")
-
+ 
+        print(f"[{self.name}] Expanded r={r_exp:.2f} mm | "
+              f"centre ({cx_j1:.2f}, {yc_j1:.2f}) mm (J1 frame) | {n_points} pts CCW")
+ 
+        # Pass J1-frame centre to _plot so the visualisation is correct
         plot_b64 = self._plot(pts, xc, yc, r, sigma,
-                              r_exp, cx_s, yc, sample_x, sample_y)
+                              r_exp, cx_j1, yc_j1, sample_x, sample_y)
+ 
         points = [
             {"x": float(sample_x[i]), "y": float(sample_y[i]), "z": float(sample_z[i])}
             for i in range(n_points)
         ]
-        return points, r_exp, plot_b64
+ 
+        # Trunk centre in J1 frame — passed to Arduino via SET_TRUNK at /init
+        trunk_centre = {
+            "cx_mm": float(cx_j1),
+            "cy_mm": float(yc_j1),
+        }
+ 
+        return points, r_exp, plot_b64, trunk_centre
 
     # ------------------------------------------------------------------ #
     #  stop()                                                             #
@@ -573,7 +631,7 @@ if __name__ == "__main__":
         done.wait()
         print("Scan complete.")
 
-        points, r_exp, plot_b64 = worker.process_data()
+        points, r_exp, plot_b64, trunk_center = worker.process_data()
         if r_exp is not None:
             print(f"r_exp={r_exp:.2f} mm  |  {len(points)} contour points")
             with open("result_plot.png", "wb") as f:

@@ -5,61 +5,6 @@ import threading
 # Create the blueprint
 api_blueprint = Blueprint('api', __name__)
 
-@api_blueprint.route('/init', methods=['POST'])
-def init():
-    """
-    Configure ports and scan parameters.
-    Must be called before any robot or scan operations.
-    Body: {
-        "robot_port": "COM5",     ← Arduino Mega (motors + TOF)
-        "lidar_port": "COM3",     ← LiDAR scanner
-        "radius_cm": 5,
-        "distance_cm": null,
-        "safety_margin_deg": 5,
-        "scan_duration_sec": 30,
-        "circle_tolerance_mm": 50
-    }
-    """
-    data         = request.get_json()
-    lidar_worker = current_app.config.get('LIDAR_WORKER')
-    robot_worker = current_app.config.get('ROBOT_WORKER')
-
-    if not lidar_worker or not robot_worker:
-        return jsonify({"error": "Workers not initialized"}), 500
-
-    # ── Connect robot serial (motors + TOF) ───────────────
-    robot_port = data.get("robot_port")
-    if robot_port:
-        robot_worker.connect(robot_port)
-        print(f"[Boss] Robot connected on {robot_port}")
-    elif not robot_worker.port:
-        return jsonify({"error": "robot_port required — not connected yet"}), 400
-
-    # ── Connect lidar serial ──────────────────────────────
-    lidar_port = data.get("lidar_port")
-    if lidar_port:
-        lidar_worker.port = lidar_port
-        print(f"[Boss] Lidar port set to {lidar_port}")
-
-    # ── Store scan config ─────────────────────────────────
-    current_app.config['SCAN_CONFIG'] = {
-        "port":                 lidar_port or lidar_worker.port,
-        "radius_mm":            data.get("radius_cm", 5.0) * 10,
-        "distance_cm":          data.get("distance_cm"),
-        "safety_margin_deg":    data.get("safety_margin_deg", 5),
-        "scan_duration_sec":    data.get("scan_duration_sec", 30),
-        "circle_toleration_mm": data.get("circle_tolerance_mm", 50),
-    }
-
-    if data.get("radius_cm"):
-        robot_worker.R_trajectory = float(data.get("radius_cm"))
-
-    return jsonify({
-        "msg":        "Initialized",
-        "robot_port": robot_worker.port,
-        "lidar_port": lidar_port or lidar_worker.port
-    }), 200
-
 @api_blueprint.route('/hello', methods=['GET'])
 def hello():
     return jsonify({"answer": "hello, system is good"}), 200
@@ -156,7 +101,7 @@ def pipeline_run():
     if not points:
         return jsonify({"error": "LiDAR scan returned no contour points"}), 500
  
-    # Limit to max_points
+    # Set scan stop condition with max_points
     points = points[:max_points]
     total  = len(points)
     print(f"[Pipeline] {total} contour points (max={max_points})")
@@ -175,7 +120,7 @@ def pipeline_run():
         y_cm = pt["y"] * MM_TO_CM
         z_cm = pt.get("z", 0) * MM_TO_CM
  
-        print(f"\n[Pipeline] ── Point {i+1}/{total} ──")
+        print(f"\n[Pipeline]  Point {i+1}/{total} ──")
         print(f"[Pipeline] Target: x={x_cm:.2f} y={y_cm:.2f} z={z_cm:.2f} cm")
  
         result = {
@@ -283,33 +228,92 @@ def pipeline_run():
 
 #======Lidar routes===========================================================
 
+# @api_blueprint.route('/lidar/scan', methods=['POST'])
+# def lidar_scan_data():
+#     '''
+#     Def:
+#     Input:
+#     JSON
+#     Output:
+#     '''
+#     lidar_worker = current_app.config.get('LIDAR_WORKER')
+#     if not lidar_worker:
+#         return jsonify({"error": "Lidar worker not initialized"}), 500
+
+#     lidar_data_path = current_app.config.get('LIDAR_DATA')
+#     if not lidar_data_path:
+#         return jsonify({"error": "LIDAR_DATA path not configured"}), 500
+
+#     path = os.path.join(lidar_data_path, 'raw.csv')
+
+#     data                = request.get_json()
+#     port                = data.get("port")
+#     radius_cm           = data.get("radius_cm")
+#     distance_cm         = data.get("distance_cm")       # None → triggers auto-detect in scan()
+#     safety_margin_deg   = data.get("safety_margin_deg")
+#     scan_duration_sec   = data.get("scan_duration_sec")
+#     circle_toleration_mm = data.get("circle_toleration_mm")
+
+#     # Block until scan() finishes (done_event.set() called in scan()'s finally block)
+#     done = threading.Event()
+#     lidar_worker.scan(
+#         port,
+#         radius_cm,
+#         distance_cm,
+#         safety_margin_deg,
+#         scan_duration_sec,
+#         circle_toleration_mm,
+#         done_event=done
+#     )
+#     done.wait()
+
+#     points, r_exp, img = lidar_worker.process_data(path=path)
+
+#     return jsonify({
+#         # "port":                 port,
+#         # "distance_cm":          distance_cm,
+#         # "safety_margin_deg":    safety_margin_deg,
+#         # "scan_duration_sec":    scan_duration_sec,
+#         # "circle_toleration_mm": circle_toleration_mm,
+#         "r_exp":                r_exp,
+#         "points":               points,
+#         "msg":                  "Scan complete",
+#         "bscan_image":          img
+#     }), 200
+
 @api_blueprint.route('/lidar/scan', methods=['POST'])
 def lidar_scan_data():
     '''
-    Def:
-    Input:
-    JSON
-    Output:
+    Trigger a LiDAR scan and return processed contour points.
+    Body: {
+        "port": "COM3",
+        "radius_cm": 15.0,
+        "distance_cm": null,
+        "safety_margin_deg": 5,
+        "scan_duration_sec": 30,
+        "circle_toleration_mm": 50,
+        "lidar_offset_mm": 0.0
+    }
     '''
     lidar_worker = current_app.config.get('LIDAR_WORKER')
     if not lidar_worker:
         return jsonify({"error": "Lidar worker not initialized"}), 500
-
+ 
     lidar_data_path = current_app.config.get('LIDAR_DATA')
     if not lidar_data_path:
         return jsonify({"error": "LIDAR_DATA path not configured"}), 500
-
+ 
     path = os.path.join(lidar_data_path, 'raw.csv')
-
-    data                = request.get_json()
-    port                = data.get("port")
-    radius_cm           = data.get("radius_cm")
-    distance_cm         = data.get("distance_cm")       # None → triggers auto-detect in scan()
-    safety_margin_deg   = data.get("safety_margin_deg")
-    scan_duration_sec   = data.get("scan_duration_sec")
+ 
+    data                 = request.get_json()
+    port                 = data.get("port")
+    radius_cm            = data.get("radius_cm")
+    distance_cm          = data.get("distance_cm")
+    safety_margin_deg    = data.get("safety_margin_deg")
+    scan_duration_sec    = data.get("scan_duration_sec")
     circle_toleration_mm = data.get("circle_toleration_mm")
-
-    # Block until scan() finishes (done_event.set() called in scan()'s finally block)
+    lidar_offset_mm      = data.get("lidar_offset_mm", 0.0)
+ 
     done = threading.Event()
     lidar_worker.scan(
         port,
@@ -321,42 +325,70 @@ def lidar_scan_data():
         done_event=done
     )
     done.wait()
-
-    points, r_exp, img = lidar_worker.process_data(path=path)
-
+ 
+    points, r_exp, img, trunk_centre = lidar_worker.process_data(
+        path=path,
+        lidar_offset_mm=lidar_offset_mm
+    )
+ 
     return jsonify({
-        # "port":                 port,
-        # "distance_cm":          distance_cm,
-        # "safety_margin_deg":    safety_margin_deg,
-        # "scan_duration_sec":    scan_duration_sec,
-        # "circle_toleration_mm": circle_toleration_mm,
-        "r_exp":                r_exp,
-        "points":               points,
-        "msg":                  "Scan complete",
-        "bscan_image":          img
+        "r_exp":         r_exp,
+        "points":        points,
+        "trunk_centre":  trunk_centre,
+        "msg":           "Scan complete",
+        "bscan_image":   img
     }), 200
-
+ 
+ 
 @api_blueprint.route('/lidar/process_data', methods=['POST'])
 def lidar_process_data():
     data = request.get_json()
     path = data.get("path")
-    path = os.path.join(current_app.config.get('LIDAR_DATA') , path) if path else "raw.csv"
-    
+    path = os.path.join(current_app.config.get('LIDAR_DATA'), path) if path else "raw.csv"
+    lidar_offset_mm = data.get("lidar_offset_mm", 0.0)
+ 
     if not path:
         return jsonify({"error": "No path provided"}), 400
-
-    # 2. Access the Lidar worker instance (passed from the Boss)
+ 
     lidar_worker = current_app.config.get('LIDAR_WORKER')
-    
     if not lidar_worker:
         return jsonify({"error": "Lidar worker not initialized"}), 500
-
-    # 3. Call the worker method
+ 
     try:
-        points, r, plot_b64 = lidar_worker.process_data(path=path)
-        return jsonify({"points": points, "r": r, "image": plot_b64}), 200
+        points, r, plot_b64, trunk_centre = lidar_worker.process_data(
+            path=path,
+            lidar_offset_mm=lidar_offset_mm
+        )
+        return jsonify({
+            "points":       points,
+            "r":            r,
+            "image":        plot_b64,
+            "trunk_centre": trunk_centre
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+# @api_blueprint.route('/lidar/process_data', methods=['POST'])
+# def lidar_process_data():
+#     data = request.get_json()
+#     path = data.get("path")
+#     path = os.path.join(current_app.config.get('LIDAR_DATA') , path) if path else "raw.csv"
+    
+#     if not path:
+#         return jsonify({"error": "No path provided"}), 400
+
+#     # 2. Access the Lidar worker instance (passed from the Boss)
+#     lidar_worker = current_app.config.get('LIDAR_WORKER')
+    
+#     if not lidar_worker:
+#         return jsonify({"error": "Lidar worker not initialized"}), 500
+
+#     # 3. Call the worker method
+#     try:
+#         points, r, plot_b64, trunk_center = lidar_worker.process_data(path=path)
+#         return jsonify({"points": points, "r": r, "image": plot_b64, "trunk_center": trunk_center}), 200
+#     except Exception as e:
+#         return jsonify({"error": str(e)}), 500
     
 #==================================================================================================    
 #======ROBOT ROUTES================================================================================
@@ -678,7 +710,61 @@ def debug_config():
  
 #     return jsonify({"msg": "Initialized"}), 200
  
- 
+@api_blueprint.route('/init', methods=['POST'])
+def init():
+    """
+    Configure ports and scan parameters.
+    Must be called before any robot or scan operations.
+    Body: {
+        "robot_port": "COM5",     ← Arduino Mega (motors + TOF)
+        "lidar_port": "COM3",     ← LiDAR scanner
+        "radius_cm": 5,
+        "distance_cm": null,
+        "safety_margin_deg": 5,
+        "scan_duration_sec": 30,
+        "circle_tolerance_mm": 50
+    }
+    """
+    data         = request.get_json()
+    lidar_worker = current_app.config.get('LIDAR_WORKER')
+    robot_worker = current_app.config.get('ROBOT_WORKER')
+
+    if not lidar_worker or not robot_worker:
+        return jsonify({"error": "Workers not initialized"}), 500
+
+    # ── Connect robot serial (motors + TOF) ───────────────
+    robot_port = data.get("robot_port")
+    if robot_port:
+        robot_worker.connect(robot_port)
+        print(f"[Boss] Robot connected on {robot_port}")
+    elif not robot_worker.port:
+        return jsonify({"error": "robot_port required — not connected yet"}), 400
+
+    # ── Connect lidar serial ──────────────────────────────
+    lidar_port = data.get("lidar_port")
+    if lidar_port:
+        lidar_worker.port = lidar_port
+        print(f"[Boss] Lidar port set to {lidar_port}")
+
+    # ── Store scan config ─────────────────────────────────
+    current_app.config['SCAN_CONFIG'] = {
+        "port":                 lidar_port or lidar_worker.port,
+        "radius_mm":            data.get("radius_cm", 5.0) * 10,
+        "distance_cm":          data.get("distance_cm"),
+        "safety_margin_deg":    data.get("safety_margin_deg", 5),
+        "scan_duration_sec":    data.get("scan_duration_sec", 30),
+        "circle_toleration_mm": data.get("circle_tolerance_mm", 50),
+    }
+
+    if data.get("radius_cm"):
+        robot_worker.R_trajectory = float(data.get("radius_cm"))
+
+    return jsonify({
+        "msg":        "Initialized",
+        "robot_port": robot_worker.port,
+        "lidar_port": lidar_port or lidar_worker.port
+    }), 200
+
 # ── /run — triggers LiDAR scan ──────────────────────────────────────
 @api_blueprint.route('/run', methods=['POST'])
 def run():
