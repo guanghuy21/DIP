@@ -7,7 +7,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 
-# ── Constants (matching lidar_scanner.py exactly) ─────────────────────────────
+# ── Constants (matching lidar_worker.py exactly) ─────────────────────────────
 BAUDRATE                = 115200
 MOTOR_STARTUP_DELAY     = 3
 MAX_POINTS_TO_KEEP      = 10000   # reference name
@@ -25,9 +25,13 @@ DEFAULT_RAW_IMG  = os.path.join(DEFAULT_RAW_PATH, "processed_lidar.png")
 os.makedirs(DEFAULT_RAW_PATH, exist_ok=True)
 
 
-# ── Module-level helpers (copied verbatim from lidar_scanner.py) ──────────────
+# ── Module-level helpers (copied verbatim from lidar_worker.py) ──────────────
+
 
 def polar_to_cartesian(angle_deg, distance_mm):
+    """
+    (angle_deg, distance_mm) -> (x, y)
+    """
     angle_rad = math.radians(angle_deg)
     x = distance_mm * math.cos(angle_rad)
     y = distance_mm * math.sin(angle_rad)
@@ -35,6 +39,10 @@ def polar_to_cartesian(angle_deg, distance_mm):
 
 
 def fit_circle(points):
+
+    """
+    KASA method: 
+    """
     if len(points) < 3:
         return None
     try:
@@ -77,7 +85,8 @@ def distance_to_circle(point, circle_params):
 
 def filter_by_circle(points, expected_radius_mm,
                      tolerance_mm=CIRCLE_FIT_TOLERANCE_MM):
-    """Verbatim port from lidar_scanner.py — no center_hint."""
+    
+    """Verbatim port from lidar_worker.py — no center_hint."""
     if len(points) < MIN_POINTS_FOR_CIRCLE_FIT:
         return points, None
     cartesian_points = [polar_to_cartesian(angle, distance)
@@ -101,7 +110,7 @@ def filter_by_circle(points, expected_radius_mm,
 
 
 def filter_scan_data(scan, min_angle, max_angle):
-    """Verbatim port from lidar_scanner.py."""
+    """Verbatim port from lidar_worker.py."""
     filtered = []
     wraps_around = min_angle > max_angle
     for quality, angle, distance in scan:
@@ -116,7 +125,7 @@ def filter_scan_data(scan, min_angle, max_angle):
 
 def calculate_scan_angle(radius_cm, distance_cm,
                           safety_margin=SAFETY_MARGIN_DEGREES):
-    """Verbatim port from lidar_scanner.py."""
+    """Verbatim port from lidar_worker.py."""
     half_angle_rad = math.atan(radius_cm / distance_cm)
     half_angle_deg = math.degrees(half_angle_rad)
     half_angle_with_margin = half_angle_deg + safety_margin
@@ -146,7 +155,7 @@ class LidarThread(threading.Thread):
             measured along the robot's forward direction (mm).
             The LiDAR sits between J1 and the tree, so its measurements
             are shorter than J1-frame distances by this amount.
-            This value is added to the fitted trunk centre y-coordinate
+            This value is added to the fitted trunk center y-coordinate
             in process_data() to shift all waypoints into the J1 frame.
             Can be overridden per process_data() call if needed.
         """
@@ -180,7 +189,7 @@ class LidarThread(threading.Thread):
             worker = LidarThread("LidarWorker-1")
             done   = worker.submit_scan(port="COM4", radius_cm=15.0)
             done.wait()
-            points, r_exp, plot_b64 = worker.process_data()
+            points, r_exp, plot_b64, trunk_center = worker.process_data()
         """
         if self.is_alive():
             raise RuntimeError(f"[{self.name}] Thread already running.")
@@ -198,7 +207,7 @@ class LidarThread(threading.Thread):
         return self._done_event
 
     # ------------------------------------------------------------------ #
-    #  scan() — scan loop is a precise port of lidar_scanner.py main()   #
+    #  scan() — scan loop is a precise port of lidar_worker.py main()   #
     # ------------------------------------------------------------------ #
     def scan(self, port, radius_cm, distance_cm=None,
              safety_margin_deg=SAFETY_MARGIN_DEGREES,
@@ -232,7 +241,7 @@ class LidarThread(threading.Thread):
             print(f"[{self.name}] Scan window: {min_angle:.2f}° → {max_angle:.2f}°  "
                   f"(half {half_angle:.2f}° + {safety_margin_deg}° margin)")
 
-            # ── Scan variables — names match lidar_scanner.py exactly ────
+            # ── Scan variables — names match lidar_worker.py exactly ────
             data_buffer            = []
             total_points_collected = 0
             points_rejected_angle  = 0
@@ -247,7 +256,7 @@ class LidarThread(threading.Thread):
             print(f"[{self.name}] Scan started — duration {scan_duration_sec}s  "
                   f"buffer limit {MAX_POINTS_TO_KEEP} pts")
 
-            # ── Main scan loop — direct port of lidar_scanner.py ─────────
+            # ── Main scan loop — direct port of lidar_worker.py ─────────
             for scan in self._lidar.iter_scans(max_buf_meas=50000):
                 current_time = time.time()
                 elapsed_time = current_time - start_time
@@ -271,7 +280,7 @@ class LidarThread(threading.Thread):
                     if circle_params and scan_count == CIRCLE_UPDATE_INTERVAL:
                         cx, cy, r = circle_params
                         print(f"\n[{self.name}] Circle fitted: "
-                              f"centre=({cx:.1f}, {cy:.1f}) mm  "
+                              f"center=({cx:.1f}, {cy:.1f}) mm  "
                               f"r={r:.1f} mm  (expected {expected_radius_mm:.1f} mm)")
 
                 # LAYER 2: Filter by circle
@@ -291,10 +300,10 @@ class LidarThread(threading.Thread):
                         data_buffer.append((quality, angle, distance))
                     else:
                         worst_quality = min(data_buffer, key=lambda p: p[0])[0]
-                        if quality > worst_quality:
+                        if quality > worst_quality:                                 # if quality_new > min(buffer_qualities)
                             worst_point = min(data_buffer, key=lambda p: p[0])
-                            data_buffer.remove(worst_point)
-                            data_buffer.append((quality, angle, distance))
+                            data_buffer.remove(worst_point)                         # remove point with min quality from buffer
+                            data_buffer.append((quality, angle, distance))          # insert new point
                             points_rejected_buffer += 1
                         else:
                             points_rejected_buffer += 1
@@ -357,7 +366,7 @@ class LidarThread(threading.Thread):
         points       : list of dict  {"x": mm, "y": mm, "z": mm}
         r_exp        : float  expanded scan radius in mm
         plot_b64     : str    base64-encoded PNG
-        trunk_centre : dict   {"cx_mm": float, "cy_mm": float}  in J1 frame
+        trunk_center : dict   {"cx_mm": float, "cy_mm": float}  in J1 frame
         """
         # Resolve which offset to use — per-call override or instance default
         offset_mm = lidar_offset_mm if lidar_offset_mm is not None \
@@ -366,7 +375,7 @@ class LidarThread(threading.Thread):
         print(f"[{self.name}] Processing: {path}")
         if offset_mm != 0.0:
             print(f"[{self.name}] LiDAR→J1 offset: {offset_mm:.1f} mm  "
-                  f"(trunk centre shifted into J1 frame)")
+                  f"(trunk center shifted into J1 frame)")
  
         qualities, angles, distances = self._load_csv(path)
         if not angles:
@@ -419,20 +428,20 @@ class LidarThread(threading.Thread):
  
         pts = np.array(list(zip(xs, ys_shifted)))
         xc, yc, r, sigma = taubinSVD(pts)
-        print(f"[{self.name}] LiDAR frame — centre ({xc:.2f}, {yc:.2f}) mm | "
+        print(f"[{self.name}] LiDAR frame — center ({xc:.2f}, {yc:.2f}) mm | "
               f"r={r:.2f} mm | σ={sigma:.3f}")
  
         # ── Apply LiDAR→J1 offset ─────────────────────────────────────────
         # The LiDAR is closer to the tree than J1 by offset_mm.
-        # Adding offset_mm to yc converts the trunk centre from the LiDAR
+        # Adding offset_mm to yc converts the trunk center from the LiDAR
         # frame to the J1 frame.  The x-axis is not affected.
         yc_j1 = yc - offset_mm   # ← use resolved offset_mm, not raw parameter
         cx_j1 = xc
  
-        print(f"[{self.name}] J1 frame    — centre ({cx_j1:.2f}, {yc_j1:.2f}) mm  "
+        print(f"[{self.name}] J1 frame    — center ({cx_j1:.2f}, {yc_j1:.2f}) mm  "
               f"(+{offset_mm:.1f} mm on Y)")
  
-        # ── Generate waypoints around J1-frame trunk centre ───────────────
+        # ── Generate waypoints around J1-frame trunk center ───────────────
         expand_mm = 100.0   # gap from trunk surface to antenna tip
         n_points  = 36
         r_exp     = r + expand_mm
@@ -442,15 +451,15 @@ class LidarThread(threading.Thread):
             for i in range(n_points)
         ])
  
-        # Use J1-frame centre (cx_j1, yc_j1) — not the old cx_s=0 / yc
+        # Use J1-frame center (cx_j1, yc_j1) 
         sample_x = cx_j1 + r_exp * np.cos(sample_angles)
         sample_y = yc_j1 + r_exp * np.sin(sample_angles)
         sample_z = np.full(n_points, 10)
  
         print(f"[{self.name}] Expanded r={r_exp:.2f} mm | "
-              f"centre ({cx_j1:.2f}, {yc_j1:.2f}) mm (J1 frame) | {n_points} pts CCW")
+              f"center ({cx_j1:.2f}, {yc_j1:.2f}) mm (J1 frame) | {n_points} pts CCW")
  
-        # Pass J1-frame centre to _plot so the visualisation is correct
+        # Pass J1-frame center to _plot so the visualisation is correct
         plot_b64 = self._plot(pts, xc, yc, r, sigma,
                               r_exp, cx_j1, yc_j1, sample_x, sample_y)
  
@@ -459,13 +468,13 @@ class LidarThread(threading.Thread):
             for i in range(n_points)
         ]
  
-        # Trunk centre in J1 frame — passed to Arduino via SET_TRUNK at /init
-        trunk_centre = {
+        # Trunk center in J1 frame — passed to Arduino via SET_TRUNK at /init
+        trunk_center = {
             "cx_mm": float(cx_j1),
             "cy_mm": float(yc_j1),
         }
  
-        return points, r_exp, plot_b64, trunk_centre
+        return points, r_exp, plot_b64, trunk_center
 
     # ------------------------------------------------------------------ #
     #  stop()                                                             #
@@ -473,35 +482,192 @@ class LidarThread(threading.Thread):
     def stop(self):
         self.running = False
 
+    # ------------------------------------------------------------------ #                      #
     # ------------------------------------------------------------------ #
-    #  _plot() — unchanged from original worker                          #
-    # ------------------------------------------------------------------ #
+    # def _plot(self, points, xc, yc, r, sigma,
+    #           r_exp, cx_j1, yc_j1, sample_x, sample_y):
+    #     xs = points[:, 0] - xc
+    #     ys = points[:, 1]
+
+    #     fig, ax = plt.subplots(figsize=(7, 7))
+    #     ax.scatter(xs, ys, s=6, color='steelblue', alpha=0.55, label='Scan points')
+    #     ax.add_patch(plt.Circle((0, yc), r, color='black', fill=False,
+    #                             linewidth=1.8, label=f'Fit  r={r:.1f} mm'))
+    #     ax.plot(0, yc, 'k+', markersize=10, label='Fit center')
+
+    #     ax.add_patch(plt.Circle((cx_j1 - xc, yc_j1), r_exp, color='green', fill=False,
+    #                             linewidth=1.8, linestyle='--',
+    #                             label=f'Expanded  r={r_exp:.1f} mm'))
+    #     ax.plot(cx_j1 - xc, yc_j1, 'g+', markersize=10, label=f'Shifted center (y={yc_j1:.1f})')
+    #     ax.scatter(sample_x, sample_y, s=55, color='red', edgecolors='black',
+    #                zorder=5, label=f'{len(sample_x)}-pt contour (0° CCW)')
+    #     ax.scatter(sample_x[0], sample_y[0], s=120, color='yellow',
+    #                edgecolors='black', zorder=6, label='Start (0°)')
+    #     ax.set_aspect('equal', adjustable='datalim')
+    #     ax.axvline(0, color='grey', linewidth=0.6, alpha=0.4)
+    #     ax.set_title(f'Fit r={r:.2f} mm  →  Expanded r={r_exp:.2f} mm   σ={sigma:.3f} mm')
+    #     ax.set_xlabel('X (mm)');  ax.set_ylabel('Y (mm)')
+    #     ax.legend(fontsize=8, loc='upper right')
+    #     ax.grid(True, linestyle=':', alpha=0.5)
+    #     plt.tight_layout()
+
+    #     buf = io.BytesIO()
+    #     fig.savefig(buf, format='png', dpi=120)
+    #     fig.savefig(DEFAULT_RAW_IMG, format='png', dpi=120)
+    #     plt.close(fig)
+    #     buf.seek(0)
+    #     return base64.b64encode(buf.read()).decode('utf-8')
     def _plot(self, points, xc, yc, r, sigma,
-              r_exp, cx_s, yc_s, sample_x, sample_y):
-        xs = points[:, 0] - xc
-        ys = points[:, 1]
+              r_exp, cx_j1, yc_j1, sample_x, sample_y, offset_mm=0.0):
+        """
+        Render the LiDAR scan result as a 2D Matplotlib figure and return
+        it as a base64-encoded PNG string.
+
+        Coordinate system used in this plot (display frame)
+        ----------------------------------------------------
+        All raw scan points are stored in the LiDAR sensor frame, where
+        the sensor itself is the origin (distance = 0).  Before plotting,
+        the points are re-centerd so that the fitted trunk circle center
+        lands at x = 0 in the display.  The y-axis points toward the trunk.
+
+        The y_offset_mm = 50 mm shift that was applied to ys in process_data()
+        means:
+          • The LiDAR sensor sits at  (−xc,  y_offset_mm)  in display coords.
+            Because y_offset_mm = 50 mm, the sensor is always 50 mm above the
+            plot origin on the y-axis.
+          • J1 sits offset_mm behind the LiDAR along y, so its display position
+            is  (−xc,  y_offset_mm − offset_mm).
+            When offset_mm == 50 mm (the default), J1 lands at y = 0 — the plot
+            origin — which is the most intuitive layout.
+
+        Parameters
+        ----------
+        points     : np.ndarray  shape (n,2) - raw (x, y) after y_offset shift
+        xc, yc     : float  TaubinSVD circle center in LiDAR frame
+        r          : float  fitted trunk radius (mm)
+        sigma      : float  TaubinSVD residual (mm)
+        r_exp      : float  expanded scan radius = r + 100 mm (antenna gap)
+        cx_j1      : float  trunk center x in J1 frame  (= xc, lateral unchanged)
+        yc_j1      : float  trunk center y in J1 frame  (= yc + offset_mm)
+        sample_x   : np.ndarray  waypoint x-coords in J1 frame (mm)
+        sample_y   : np.ndarray  waypoint y-coords in J1 frame (mm)
+        offset_mm  : float  LiDAR-to-J1 distance (mm), used to place markers
+        """
+
+        # ── 1. Re-center scan points to x=0 ──
+        # pts[:,0] contains x-coords in the LiDAR frame, where xc is the circle
+        # fit x-center.  Subtracting xc shifts the trunk to x=0 in display space.
+        # pts[:,1] (y) is left as-is — it already contains the y_offset_mm shift
+        # that places the LiDAR sensor at y = y_offset_mm (= 50 mm) and
+        # implicitly places J1 at y = y_offset_mm − offset_mm.
+        xs = points[:, 0] - xc   # x in display frame
+        ys = points[:, 1]         # y in display frame (= LiDAR-frame y + 50 mm)
 
         fig, ax = plt.subplots(figsize=(7, 7))
+
+        # ── 2. Raw scan points ────────────────────────────────────────────────────
+        # Every (angle, distance) reading that survived the angle-window and
+        # quality-ranked buffer is plotted here.  The cluster of points forms the
+        # visible arc of the trunk surface as seen from the LiDAR.
         ax.scatter(xs, ys, s=6, color='steelblue', alpha=0.55, label='Scan points')
-        ax.add_patch(plt.Circle((0, yc), r, color='black', fill=False,
-                                linewidth=1.8, label=f'Fit  r={r:.1f} mm'))
-        ax.plot(0, yc, 'k+', markersize=10, label='Fit centre')
-        ax.add_patch(plt.Circle((cx_s, yc_s), r_exp, color='green', fill=False,
-                                linewidth=1.8, linestyle='--',
-                                label=f'Expanded  r={r_exp:.1f} mm'))
-        ax.plot(cx_s, yc_s, 'g+', markersize=10, label=f'Shifted centre (y={yc_s:.1f})')
-        ax.scatter(sample_x, sample_y, s=55, color='red', edgecolors='black',
-                   zorder=5, label=f'{len(sample_x)}-pt contour (0° CCW)')
-        ax.scatter(sample_x[0], sample_y[0], s=120, color='yellow',
-                   edgecolors='black', zorder=6, label='Start (0°)')
+
+        # ── 3. LiDAR-frame trunk circle fit ──────────────────────────────────────
+        # The TaubinSVD fit found the circle that best matches the scan arc.
+        # center is at (0, yc) in display coords — x=0 because we re-centerd by xc.
+        # This is the trunk boundary as perceived by the LiDAR sensor.
+        ax.add_patch(plt.Circle(
+            (0, yc), r,
+            color='black', fill=False, linewidth=1.8,
+            label=f'Trunk fit (LiDAR frame)  r={r:.1f} mm'
+        ))
+
+        # ── 4. LiDAR-frame trunk center marker ───────────────────────────────────
+        # The black cross marks where the TaubinSVD estimated the trunk center to
+        # be, expressed in the LiDAR sensor's own coordinate frame.  This point
+        # is NOT directly usable by the robot IK — the J1-frame center (step 7) is.
+        ax.plot(0, yc, 'k+', markersize=12, markeredgewidth=2,
+                label=f'Trunk center (LiDAR frame)  y={yc:.1f} mm')
+
+        # ── 5. J1-frame expanded scan circle ─────────────────────────────────────
+        # The robot arm positions the antenna on a circle of radius r_exp =
+        # r + 100 mm (100 mm = antenna–trunk-surface gap), centerd on the trunk
+        # center expressed in the J1 frame.  This is the actual trajectory the
+        # arm will follow.
+        # cx_j1 − xc applies the same re-centring used for the scan points so
+        # this circle aligns with the point cloud in the display.
+        ax.add_patch(plt.Circle(
+            (cx_j1 - xc, yc_j1), r_exp,
+            color='green', fill=False, linewidth=1.8, linestyle='--',
+            label=f'Scan trajectory (J1 frame)  r_exp={r_exp:.1f} mm'
+        ))
+
+        # ── 6. J1-frame trunk center marker ──────────────────────────────────────
+        # The green cross is the trunk center in the robot's J1 coordinate frame,
+        # obtained by adding offset_mm to the LiDAR-frame yc.  This is the origin
+        # around which all 36 waypoints are generated, and the value sent to the
+        # Arduino as SET_TRUNK.
+        ax.plot(cx_j1 - xc, yc_j1, 'g+', markersize=12, markeredgewidth=2,
+                label=f'Trunk center (J1 frame)  y={yc_j1:.1f} mm')
+
+        # ── 7. Waypoints ──────────────────────────────────────────────────────────
+        # The 36 red dots are the antenna-tip positions the arm will visit,
+        # evenly spaced around the expanded circle.  sample_x and sample_y are
+        # in J1 frame, so the same re-centring (− xc) is applied to align them
+        # with the scan point cloud.
+        ax.scatter(sample_x - xc, sample_y, s=55, color='red', edgecolors='black',
+                   zorder=5, label=f'{len(sample_x)}-pt waypoints (CCW)')
+
+        # ── 8. Start waypoint ─────────────────────────────────────────────────────
+        # Waypoint 0 (θ = 180°) is the nearest point to the robot — the arm starts
+        # directly in front of the trunk at minimum extension.
+        ax.scatter(sample_x[0] - xc, sample_y[0], s=140, color='yellow',
+                   edgecolors='black', zorder=6, label='Start waypoint (θ=180°)')
+
+        # ── 9. LiDAR sensor position ──────────────────────────────────────────────
+        # The triangle marks the physical location of the LiDAR sensor in the
+        # display frame.  In process_data(), all y-coords received a +50 mm shift
+        # (y_offset_mm), which places the sensor at y = +50 mm.  The x-position
+        # is −xc (the same re-centring applied to the scan points).
+        y_offset_mm = 50.0   # must match the value used in process_data()
+        lidar_display_x = -xc
+        lidar_display_y = y_offset_mm
+        ax.plot(lidar_display_x, lidar_display_y,
+                'r^', markersize=12, markeredgewidth=1.5,
+                label=f'LiDAR sensor  ({lidar_display_x:.1f}, {lidar_display_y:.0f}) mm')
+
+        # ── 10. Joint 1 axis position ─────────────────────────────────────────────
+        # J1 is offset_mm behind the LiDAR along the forward (y) direction.
+        # In display coords:  y_J1 = y_LiDAR − offset_mm = 50 − offset_mm.
+        # When offset_mm = 50 mm, J1 lands exactly at y = 0 — the display origin.
+        # The square symbol distinguishes it from the LiDAR triangle.
+        j1_display_x = -xc
+        j1_display_y = y_offset_mm - offset_mm
+        ax.plot(j1_display_x, j1_display_y,
+                'bs', markersize=12, markeredgewidth=1.5,
+                label=f'J1 axis  ({j1_display_x:.1f}, {j1_display_y:.0f}) mm')
+
+        # ── 11. Vertical axis reference line ──────────────────────────────────────
+        # The grey vertical line at x = 0 marks the forward axis of the LiDAR
+        # sensor (after re-centring).  Points to the left of it are on the
+        # left side of the trunk; points to the right are on the right side.
+        ax.axvline(0, color='grey', linewidth=0.6, alpha=0.4,
+                   label='LiDAR forward axis')
+
+        # ── 12. Axes, title, and save ─────────────────────────────────────────────
+        # equal aspect ratio preserves the circular geometry — do not remove.
         ax.set_aspect('equal', adjustable='datalim')
-        ax.axvline(0, color='grey', linewidth=0.6, alpha=0.4)
-        ax.set_title(f'Fit r={r:.2f} mm  →  Expanded r={r_exp:.2f} mm   σ={sigma:.3f} mm')
-        ax.set_xlabel('X (mm)');  ax.set_ylabel('Y (mm)')
+        ax.set_title(
+            f'LiDAR scan result\n'
+            f'Trunk fit: r={r:.1f} mm  |  Scan trajectory: r_exp={r_exp:.1f} mm  '
+            f'|  σ={sigma:.3f} mm  |  J1 offset={offset_mm:.0f} mm'
+        )
+        ax.set_xlabel('X (mm) — lateral')
+        ax.set_ylabel('Y (mm) — forward (toward trunk)')
         ax.legend(fontsize=8, loc='upper right')
         ax.grid(True, linestyle=':', alpha=0.5)
         plt.tight_layout()
 
+        # Save to file for inspection and encode for API response
         buf = io.BytesIO()
         fig.savefig(buf, format='png', dpi=120)
         fig.savefig(DEFAULT_RAW_IMG, format='png', dpi=120)
@@ -640,7 +806,7 @@ if __name__ == "__main__":
 
     def run_process_only(csv_path):
         worker = LidarThread("LidarWorker-2")
-        points, r_exp, plot_b64 = worker.process_data(csv_path)
+        points, r_exp, plot_b64, trunk_center = worker.process_data(csv_path)
         if r_exp is not None:
             print(f"r_exp={r_exp:.2f} mm  |  {len(points)} contour points")
             with open("result_plot.png", "wb") as f:
