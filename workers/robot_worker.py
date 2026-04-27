@@ -35,7 +35,7 @@ class RobotThread(threading.Thread):
         x,y,z            → Move arm (IK solved on Arduino)
         TOF_START         → Take one TOF reading
         SET_OFFSET:<val>  → Set LiDAR-to-J1 offset in cm (sent once at /init)
-        SET_TRUNK:<x>,<y> → Set trunk centre in J1 frame in cm (sent once at /init)
+        SET_TRUNK:<x>,<y> → Set trunk center in J1 frame in cm (sent once at /init)
         STATUS            → Get motor positions + TOF state
 
     Arduino replies:
@@ -44,7 +44,7 @@ class RobotThread(threading.Thread):
         UNREACHABLE       → IK failed
         DATA:millis,mm    → TOF reading result
         ACK_OFFSET:<val>  → Offset confirmed
-        ACK_TRUNK:<x>,<y> → Trunk centre confirmed
+        ACK_TRUNK:<x>,<y> → Trunk center confirmed
         MSG:...           → Informational, ignored by worker
     """
 
@@ -185,13 +185,13 @@ class RobotThread(threading.Thread):
         print(f"[{self.name}] WARNING: No ACK_OFFSET received")
         return False
 
-    def set_trunk_centre(self, cx_cm: float, cy_cm: float, timeout: float = 3.0) -> bool:
+    def set_trunk_center(self, cx_cm: float, cy_cm: float, timeout: float = 3.0) -> bool:
         """
-        Send SET_TRUNK:<cx>,<cy> to Arduino and wait for ACK_TRUNK.
+        Send SET_TRUNK:<cx>,<cy> to Arduino for Antenna Angle and wait for ACK_TRUNK.
 
-        cx_cm, cy_cm : trunk centre position in J1 frame, cm.
+        cx_cm, cy_cm : trunk center position in J1 frame, cm.
                        Obtained from lidar_worker.process_data() which returns
-                       trunk_centre = {"cx_mm": ..., "cy_mm": ...}.
+                       trunk_center = {"cx_mm": ..., "cy_mm": ...}.
                        Divide by 10 to convert mm → cm before passing here.
 
         This MUST be sent before any move commands — the Arduino rejects
@@ -214,7 +214,7 @@ class RobotThread(threading.Thread):
                 print(f"[{self.name}] << {line}")
                 if line.startswith("ACK_TRUNK:"):
                     parts = line.split(":")[1].split(",")
-                    print(f"[{self.name}] Trunk centre confirmed: "
+                    print(f"[{self.name}] Trunk center confirmed: "
                           f"({float(parts[0]):.2f}, {float(parts[1]):.2f}) cm")
                     return True
 
